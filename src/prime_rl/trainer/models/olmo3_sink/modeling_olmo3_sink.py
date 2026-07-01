@@ -205,6 +205,11 @@ class Olmo3SinkPreTrainedModel(Olmo3PreTrainedModel):
     config_class = Olmo3SinkConfig
     _no_split_modules = ["Olmo3SinkDecoderLayer"]
 
+    @classmethod
+    def from_config(cls, config, **kwargs):
+        """Mirror Prime-RL model classes, which call `from_config()` on meta."""
+        return cls._from_config(config, **kwargs)
+
     def _init_weights(self, module):
         super()._init_weights(module)
         # The sink parameter is new (absent from base Olmo3 checkpoints); when
