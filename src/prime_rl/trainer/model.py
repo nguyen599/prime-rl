@@ -31,6 +31,8 @@ from prime_rl.trainer.distributed import DeepEPExpertParallel
 from prime_rl.trainer.lora import apply_lora_to_model, freeze_all_except_lora_and_specified, strip_lora_from_state_dict
 from prime_rl.trainer.models import (
     AutoModelForCausalLMPrimeRL,
+    Olmo3SinkConfig,
+    Olmo3SinkForCausalLM,
     PreTrainedModelPrimeRL,
     PrimeLmOutput,
     cast_float_and_contiguous,
@@ -57,6 +59,19 @@ from prime_rl.utils.logger import get_logger
 from prime_rl.utils.sequence import get_cu_seqlens_from_position_ids
 from prime_rl.utils.utils import format_time
 from prime_rl.utils.vlm import get_language_model, get_vision_encoder, is_vlm_architecture
+
+
+def is_olmo3_sink_config(model_config: PretrainedConfig) -> bool:
+    architectures = getattr(model_config, "architectures", None) or []
+    return getattr(model_config, "model_type", None) == "olmo3_sink" or "Olmo3SinkForCausalLM" in architectures
+
+
+def coerce_olmo3_sink_config(model_config: PretrainedConfig, attn_implementation: str | None = None) -> PretrainedConfig:
+    if not is_olmo3_sink_config(model_config) or isinstance(model_config, Olmo3SinkConfig):
+        return model_config
+    sink_config = Olmo3SinkConfig.from_dict(model_config.to_dict())
+    sink_config._attn_implementation = getattr(model_config, "_attn_implementation", None) or attn_implementation
+    return sink_config
 
 
 def pre_download_model(model_name: str) -> None:
@@ -467,6 +482,7 @@ def get_model(
             config.name, attn_implementation=config.attn, trust_remote_code=config.trust_remote_code
         ),
     )
+    model_config = coerce_olmo3_sink_config(model_config, config.attn)
     model_config.use_cache = False
     is_vlm_arch = is_vlm_architecture(model_config)
 
@@ -590,6 +606,8 @@ def get_model(
             from transformers import AutoModelForImageTextToText
 
             model_cls = AutoModelForImageTextToText
+        elif is_olmo3_sink_config(model_config):
+            model_cls = Olmo3SinkForCausalLM
         else:
             match impl_to_use:
                 case "hf":
