@@ -913,8 +913,74 @@ def can_reinit_empty_buffers(model: nn.Module):
     if set(buffer_names) == gemma3_buffers:
         return True
 
+    # OLMo3Sink restores OLMo3's per-layer-type RoPE by replacing the single
+    # `model.rotary_emb` with `model.rotary_embs.{sliding_attention,full_attention}`.
+    # These non-persistent buffers are deterministic from config and can be
+    # rebuilt after `to_empty()`.
+    if _only_per_layer_rotary_embedding_buffers(model, buffer_names):
+        return True
+
     get_logger().warning(f"Model cannot be loaded using meta device because of buffers: {buffer_names}")
     return False
+
+
+def _only_per_layer_rotary_embedding_buffers(model: nn.Module, buffer_names: list[str]) -> bool:
+    if not buffer_names:
+        return False
+    reinitable_buffer_names = set()
+    for module_name, module in model.named_modules():
+        if not module_name.startswith("model.rotary_embs."):
+            continue
+        if not _can_reinit_rotary_embedding_buffers(module):
+            continue
+
+        module_buffer_names = {name for name, _ in module.named_buffers(recurse=False)}
+        if "inv_freq" not in module_buffer_names:
+            continue
+        for buffer_name in ("inv_freq", "original_inv_freq"):
+            if buffer_name in module_buffer_names:
+                reinitable_buffer_names.add(f"{module_name}.{buffer_name}")
+
+    return bool(reinitable_buffer_names) and set(buffer_names) == reinitable_buffer_names
+
+
+def _can_reinit_rotary_embedding_buffers(rotary_emb: nn.Module) -> bool:
+    if not hasattr(rotary_emb, "config") or not hasattr(rotary_emb, "inv_freq"):
+        return False
+    if hasattr(rotary_emb, "rope_init_fn"):
+        return True
+
+    rope_type = getattr(rotary_emb, "rope_type", None)
+    if rope_type is None:
+        return False
+    if rope_type == "default":
+        return hasattr(rotary_emb, "compute_default_rope_parameters")
+
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    return rope_type in ROPE_INIT_FUNCTIONS
+
+
+def _rope_init_fn_for_rotary_emb(rotary_emb: nn.Module):
+    if hasattr(rotary_emb, "rope_init_fn"):
+        return rotary_emb.rope_init_fn
+
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    rope_type = getattr(rotary_emb, "rope_type", "default")
+    if rope_type != "default":
+        return ROPE_INIT_FUNCTIONS[rope_type]
+    return rotary_emb.compute_default_rope_parameters
+
+
+def _reinit_rotary_embedding_buffers(rotary_emb: nn.Module, *, copy_original_inv_freq: bool) -> None:
+    inv_freq_buffer = rotary_emb.inv_freq
+    rope_init_fn = _rope_init_fn_for_rotary_emb(rotary_emb)
+    inv_freq, attention_scaling = rope_init_fn(rotary_emb.config, inv_freq_buffer.device)
+    rotary_emb.inv_freq.copy_(inv_freq)
+    if copy_original_inv_freq and hasattr(rotary_emb, "original_inv_freq"):
+        rotary_emb.original_inv_freq.copy_(inv_freq)
+    rotary_emb.attention_scaling = attention_scaling
 
 
 def fix_model_post_empty(model: nn.Module):
@@ -922,21 +988,22 @@ def fix_model_post_empty(model: nn.Module):
     # HF standard transformer model
     if "model.rotary_emb.inv_freq" in buffer_names:
         rotary_emb = model.model.rotary_emb
-        if hasattr(rotary_emb, "rope_init_fn"):
-            rope_init_fn = rotary_emb.rope_init_fn
-        else:
-            # GPT-OSS stores rope_init_fn only as a local in __init__; re-derive it
-            from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-
-            rope_init_fn = (
-                ROPE_INIT_FUNCTIONS[rotary_emb.rope_type]
-                if rotary_emb.rope_type != "default"
-                else rotary_emb.compute_default_rope_parameters
+        _reinit_rotary_embedding_buffers(
+            rotary_emb,
+            copy_original_inv_freq="model.rotary_emb.original_inv_freq" in buffer_names,
+        )
+    if _only_per_layer_rotary_embedding_buffers(model, buffer_names):
+        for module_name, rotary_emb in model.named_modules():
+            if not module_name.startswith("model.rotary_embs."):
+                continue
+            if f"{module_name}.inv_freq" not in buffer_names:
+                continue
+            if not _can_reinit_rotary_embedding_buffers(rotary_emb):
+                continue
+            _reinit_rotary_embedding_buffers(
+                rotary_emb,
+                copy_original_inv_freq=f"{module_name}.original_inv_freq" in buffer_names,
             )
-        inv_freq, rotary_emb.attention_scaling = rope_init_fn(rotary_emb.config, rotary_emb.inv_freq.device)
-        rotary_emb.inv_freq.copy_(inv_freq)
-        if "model.rotary_emb.original_inv_freq" in buffer_names:
-            rotary_emb.original_inv_freq.copy_(inv_freq)
     # Gemma3 local rotary emb
     if "model.rotary_emb_local.inv_freq" in buffer_names:
         rotary_emb_local = model.model.rotary_emb_local
