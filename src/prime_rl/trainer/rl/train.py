@@ -597,6 +597,11 @@ def train(config: TrainerConfig):
             if param.grad is not None:
                 param.grad.mul_(parallel_dims.fsdp_gradient_divide_factor)
 
+        if is_first_step and config.model.attn == "olmo3_sink_fa3":
+            from prime_rl.trainer.models.olmo3_sink.grad_check import assert_sink_grad_nonzero
+
+            assert_sink_grad_nonzero(model, logger, context="RL Olmo3Sink")
+
         # Optionally, clip the gradients
         grad_norm: torch.Tensor | None = None
         if config.optim.max_norm is not None:

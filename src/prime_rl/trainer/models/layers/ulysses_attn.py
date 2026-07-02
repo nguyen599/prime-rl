@@ -124,6 +124,75 @@ def ulysses_flash_attn_varlen_func(
     return _all_to_all_head_to_seq(out, cp_size, cp_group)
 
 
+def _ulysses_local_head_slice(tensor: torch.Tensor, cp_group: dist.ProcessGroup, cp_size: int) -> torch.Tensor:
+    """Return this rank's contiguous head slice after seq->head all-to-all."""
+    rank = dist.get_rank(group=cp_group)
+    if tensor.shape[0] % cp_size != 0:
+        raise ValueError(f"num heads ({tensor.shape[0]}) must be divisible by cp_size ({cp_size})")
+    heads_per_rank = tensor.shape[0] // cp_size
+    return tensor.narrow(0, rank * heads_per_rank, heads_per_rank)
+
+
+def ulysses_olmo3_sink_fa3_attention_forward(
+    module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask=None,
+    scaling: float | None = None,
+    dropout: float = 0.0,
+    sliding_window: int | None = None,
+    s_aux: torch.Tensor | None = None,
+    **kwargs,
+):
+    """Ulysses wrapper for Olmo3Sink's FA3 sink attention interface.
+
+    Olmo3Sink registers its own ``olmo3_sink_fa3`` attention key instead of using
+    HF's ``flash_attention_2`` function. Without this registration, CP shards the
+    sequence but the sink attention still runs locally on each shard. This wrapper
+    performs the Ulysses seq<->head all-to-all, calls the sink FA3 kernel over
+    the full sequence and local head slice, then scatters the result back.
+    """
+    del attention_mask, dropout, kwargs
+    assert query.size(0) == 1, "prime-rl Ulysses CP expects batch=1 packed inputs"
+
+    cp_size = dist.get_world_size(group=module._olmo3_sink_ulysses_group)
+    cp_group = module._olmo3_sink_ulysses_group
+    cu_seqlens = ULYSSES_PARAMS["cu_seqlens"]
+    max_seqlen = ULYSSES_PARAMS["max_seqlen"]
+
+    # [B, H, S_local, D] -> [S_local, H, D]
+    q = query.squeeze(0).transpose(0, 1).contiguous()
+    k = key.squeeze(0).transpose(0, 1).contiguous()
+    v = value.squeeze(0).transpose(0, 1).contiguous()
+
+    q = _all_to_all_seq_to_head(q, cp_size, cp_group)
+    k = _all_to_all_seq_to_head(k, cp_size, cp_group)
+    v = _all_to_all_seq_to_head(v, cp_size, cp_group)
+
+    sink = s_aux if s_aux is not None else module.sinks
+    sink = _ulysses_local_head_slice(sink, cp_group, cp_size)
+    window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
+
+    from prime_rl.trainer.models.olmo3_sink.fa3_sink_kernel import fa3_varlen_attn_with_sink_kernel
+
+    out = fa3_varlen_attn_with_sink_kernel(
+        q,
+        k,
+        v,
+        sink,
+        cu_seqlens,
+        cu_seqlens,
+        max_seqlen,
+        max_seqlen,
+        softmax_scale=scaling,
+        causal=True,
+        window_size=window_size,
+    )
+    out = _all_to_all_head_to_seq(out, cp_size, cp_group)
+    return out.reshape(1, out.shape[0], out.shape[1], out.shape[2]), None
+
+
 def substitute_ulysses_attn(
     process_group: dist.ProcessGroup,
     attn_impl: str = "flash_attention_2",
@@ -228,7 +297,7 @@ def substitute_hf_ulysses_attn(process_group: dist.ProcessGroup) -> None:
 
         window_size = (-1, -1)
         if sliding_window is not None and key_states.shape[1] > sliding_window:
-            window_size = (sliding_window, sliding_window)
+            window_size = (sliding_window - 1, 0)
 
         out = ulysses_flash_attn_varlen_func(
             flash_attn_varlen_func,
@@ -259,6 +328,16 @@ def substitute_hf_ulysses_attn(process_group: dist.ProcessGroup) -> None:
         ALL_ATTENTION_FUNCTIONS = None
 
     if ALL_ATTENTION_FUNCTIONS is not None:
+
+        def _register_ulysses_olmo3_sink_attention() -> None:
+            ALL_ATTENTION_FUNCTIONS["olmo3_sink_fa3"] = ulysses_olmo3_sink_fa3_attention_forward
+            try:
+                from transformers import AttentionInterface
+
+                AttentionInterface.register("olmo3_sink_fa3", ulysses_olmo3_sink_fa3_attention_forward)
+            except Exception:
+                # Older/newer transformers may expose only ALL_ATTENTION_FUNCTIONS.
+                pass
 
         def _ulysses_flash_attention_forward_v2(
             module,
@@ -294,3 +373,18 @@ def substitute_hf_ulysses_attn(process_group: dist.ProcessGroup) -> None:
             return attn_out, None
 
         ALL_ATTENTION_FUNCTIONS["flash_attention_2"] = _ulysses_flash_attention_forward_v2
+        _register_ulysses_olmo3_sink_attention()
+
+        try:
+            from prime_rl.trainer.models.olmo3_sink import attention as olmo3_sink_attention
+
+            olmo3_sink_attention.register_fa3_sink_attention = _register_ulysses_olmo3_sink_attention
+        except Exception:
+            pass
+
+    try:
+        from prime_rl.trainer.models.olmo3_sink.modeling_olmo3_sink import Olmo3SinkAttention
+
+        Olmo3SinkAttention._olmo3_sink_ulysses_group = process_group
+    except Exception:
+        pass

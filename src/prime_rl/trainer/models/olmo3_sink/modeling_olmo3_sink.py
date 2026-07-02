@@ -12,8 +12,9 @@ Three changes
    `[num_attention_heads]` learnable parameter, passed to the attention kernel as
    `s_aux`. The kernel appends it as an extra column of softmax logits that is
    dropped after normalization (see gpt-oss). NOTE: the `sdpa` backend does NOT
-   support `s_aux`; use `eager` (debug), `flash_attention_2`, `flash_attention_3`,
-   or `flex_attention`. We assert this in the attention forward.
+   support `s_aux`; use `eager` (debug) or `olmo3_sink_fa3`. We assert this in
+   the attention forward so generic FlashAttention backends cannot silently drop
+   sink logits.
 
 2. Packing-metadata reuse. On a flash backend with packed `position_ids`, derive
    the varlen `cu_seqlens`/`max_seqlen` once in `Olmo3SinkModel.forward` and put
@@ -168,10 +169,12 @@ class Olmo3SinkAttention(Olmo3Attention):
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
         attn_impl = self.config._attn_implementation
-        if attn_impl == "sdpa":
+        if attn_impl not in {"eager", "olmo3_sink_fa3"}:
             raise ValueError(
-                "Olmo3Sink uses attention sinks (s_aux), which the `sdpa` backend does not support. "
-                "Load with attn_implementation in {'eager','flash_attention_2','flash_attention_3','flex_attention'}."
+                "Olmo3Sink uses attention sinks (s_aux). Generic attention backends "
+                f"({attn_impl!r}) may silently ignore the sink argument. Load with "
+                "attn_implementation='olmo3_sink_fa3' for training, or 'eager' for "
+                "CPU/debug reference checks."
             )
 
         # Fallback (incl. attn_impl="eager") is our SINK-AWARE eager, not Olmo3's

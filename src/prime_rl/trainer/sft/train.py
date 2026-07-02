@@ -447,6 +447,11 @@ def train(config: SFTConfig):
                 if param.grad is not None:
                     param.grad.mul_(grad_scale)
 
+        if is_first_step and config.model.attn == "olmo3_sink_fa3":
+            from prime_rl.trainer.models.olmo3_sink.grad_check import assert_sink_grad_nonzero
+
+            assert_sink_grad_nonzero(model, logger, context="SFT Olmo3Sink")
+
         # Run validation after forward-backward (so torch.compile sees training graph first) but before
         # optimizer step (so eval_on_start evaluates untrained weights)
         if config.val is not None and (
