@@ -21,6 +21,15 @@ import triton.language as tl
 from flash_attn_interface import _flash_attn_backward
 
 
+def _fa3_fwd_accepts_sink() -> bool:
+    """Return whether the installed FA3 op has the proof-pilot sink argument."""
+    try:
+        schemas = str(torch.ops.flash_attn_3.fwd._schemas)
+    except Exception:
+        return True
+    return "sink" in schemas
+
+
 @triton.jit
 def _dsink_kernel(o_ptr, do_ptr, sink_ptr, lse2_ptr, dsink_ptr, T, D,
                   so_t, so_h, sl_h, sl_t, BLOCK_T: tl.constexpr, BLOCK_D: tl.constexpr):
@@ -60,8 +69,7 @@ def _fa3_sink_fwd(
     cu_q: torch.Tensor, cu_k: torch.Tensor, max_q: int, max_k: int,
     scale: float, causal: bool, wl: int, wr: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # patched op: `sink` is the trailing arg; kernel applies it in the epilogue.
-    out, lse, _, _ = torch.ops.flash_attn_3.fwd(
+    fa3_args = (
         q, k, v,
         None, None, None, None,            # k_new, v_new, qv, out
         cu_q, cu_k, None,                  # cu_seqlens q/k/k_new
@@ -78,9 +86,20 @@ def _fa3_sink_fwd(
         1,                                 # num_splits (DISABLE_SPLIT -> must be 1)
         None,                              # pack_gqa
         0,                                 # sm_margin
-        sink,                              # proof-pilot sink
     )
-    return out, lse
+    if _fa3_fwd_accepts_sink():
+        # patched op: `sink` is the trailing arg; kernel applies it in the epilogue.
+        out, lse, _, _ = torch.ops.flash_attn_3.fwd(*fa3_args, sink)
+        return out, lse
+
+    # Fallback for stock FA3 wheels. Standard FA3 gives no-sink output and
+    # lse_base=log(sum_j exp(score_j)). Sink attention is equivalent to scaling
+    # the token-only output by exp(lse_base - logaddexp(lse_base, sink)).
+    out, lse_base, _, _ = torch.ops.flash_attn_3.fwd(*fa3_args)
+    sink = sink.to(torch.float32).view(-1, 1)
+    lse = torch.logaddexp(lse_base.to(torch.float32), sink)
+    alpha = torch.exp(lse_base.to(torch.float32) - lse).transpose(0, 1).unsqueeze(-1)
+    return out * alpha.to(out.dtype), lse
 
 
 @_fa3_sink_fwd.register_fake
