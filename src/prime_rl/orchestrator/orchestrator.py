@@ -95,11 +95,6 @@ SHUTDOWN_TIMEOUT_S = 300
 # dataset; fail loudly instead of spinning
 MAX_CONSECUTIVE_EMPTY_BATCHES = 10
 
-# Maximum batches the orchestrator may run ahead of the trainer. The
-# dispatcher is paused via ``update_dispatch_gate`` once this is exceeded;
-# resumed when the watcher advances ``policy.version``.
-TARGET_LAG = 1
-
 
 class Orchestrator:
     # Set in ``__init__``
@@ -791,17 +786,26 @@ class Orchestrator:
         sites: after shipping a batch (step advances) and from
         ``on_new_version`` (policy advances)."""
         lead = (self.progress.step + 1) - self.policy.version
+        # ``max_off_policy_steps`` counts stale batches. A lead of 1 is the
+        # current live-policy batch, so allow one extra batch beyond the stale
+        # limit before pausing dispatch.
+        max_lead = max(1, self.config.max_off_policy_steps + 1)
         gate = self.dispatcher.dispatch_allowed
         was_set = gate.is_set()
-        if lead > TARGET_LAG:
+        if lead > max_lead:
             if was_set:
                 get_logger().info(
-                    "Pausing dispatcher to prevent orchestrator from racing from trainer. Waiting for new policy..."
+                    "Pausing dispatcher to prevent orchestrator from racing from trainer. "
+                    f"Waiting for new policy... (lead={lead}, max_lead={max_lead}, "
+                    f"max_off_policy_steps={self.config.max_off_policy_steps})"
                 )
             gate.clear()
         else:
             if not was_set:
-                get_logger().info("Resuming dispatcher")
+                get_logger().info(
+                    f"Resuming dispatcher (lead={lead}, max_lead={max_lead}, "
+                    f"max_off_policy_steps={self.config.max_off_policy_steps})"
+                )
             gate.set()
 
     async def on_version_pending(self, step: int) -> None:

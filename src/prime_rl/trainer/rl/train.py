@@ -593,32 +593,51 @@ def train(config: TrainerConfig):
 
         # compute_loss already divided by the global token count. Undo FSDP's per-rank averaging
         # across dp_cp so the final gradient is the true per-token mean over the global batch.
+        gradient_scale_start_time = time.perf_counter()
+        logger.debug("Scaling gradients by FSDP divide factor")
         for param in model.parameters():
             if param.grad is not None:
                 param.grad.mul_(parallel_dims.fsdp_gradient_divide_factor)
+        logger.debug(f"Scaled gradients in {format_time(time.perf_counter() - gradient_scale_start_time)}")
 
         if is_first_step and config.model.attn == "olmo3_sink_fa3":
             from prime_rl.trainer.models.olmo3_sink.grad_check import assert_sink_grad_nonzero
 
+            grad_canary_start_time = time.perf_counter()
             assert_sink_grad_nonzero(model, logger, context="RL Olmo3Sink")
+            logger.debug(f"Checked Olmo3Sink gradients in {format_time(time.perf_counter() - grad_canary_start_time)}")
 
         # Optionally, clip the gradients
         grad_norm: torch.Tensor | None = None
         if config.optim.max_norm is not None:
+            grad_clip_start_time = time.perf_counter()
+            logger.debug(f"Clipping gradients with max_norm={config.optim.max_norm}")
             grad_norm = clip_grad_norm_(
                 model.parameters(), max_norm=config.optim.max_norm, ep_enabled=parallel_dims.ep_enabled
             )
             if grad_norm.device.type == "cpu":
                 grad_norm = grad_norm.to(torch.device("cuda"))
+            logger.debug(f"Clipped gradients in {format_time(time.perf_counter() - grad_clip_start_time)}")
 
+        zero_grad_start_time = time.perf_counter()
+        logger.debug("Computing zero-gradient ratio")
         zero_grad_ratio = get_zero_gradient_ratio(model.parameters(), parallel_dims.dp_replicate)
+        logger.debug(f"Computed zero-gradient ratio in {format_time(time.perf_counter() - zero_grad_start_time)}")
 
         # Update the model parameters
+        optimizer_start_time = time.perf_counter()
+        logger.debug("Starting optimizer step")
         optimizer.step()
+        logger.debug(f"Finished optimizer step in {format_time(time.perf_counter() - optimizer_start_time)}")
+        zero_optimizer_grad_start_time = time.perf_counter()
         optimizer.zero_grad()
+        logger.debug(f"Zeroed optimizer gradients in {format_time(time.perf_counter() - zero_optimizer_grad_start_time)}")
 
         # Update learning rate scheduler
+        scheduler_start_time = time.perf_counter()
+        logger.debug("Starting scheduler step")
         scheduler.step()
+        logger.debug(f"Finished scheduler step in {format_time(time.perf_counter() - scheduler_start_time)}")
 
         if config.max_concurrent_runs == 1:
             current_lr = optimizer.param_groups[0]["lr"]
