@@ -549,6 +549,8 @@ class Orchestrator:
         # full arrival window (errored + filtered included); ``.effective`` is the clean subset.
         effective = batch.rollouts.effective
         metrics: dict[str, float] = {}
+        metrics["progress/training_signal_rollouts"] = n_trainable
+        metrics["progress/training_signal_rate"] = n_trainable / len(batch.rollouts)
         for subset, pool in (("all", batch.rollouts), ("effective", effective)):
             metrics |= pool.metrics.to_wandb(prefix="train/agg", subset=subset)
             for env_name, env_pool in pool.by_env().items():
@@ -702,19 +704,19 @@ class Orchestrator:
     def log_train_batch(self, batch: TrainBatch, *, step: int, step_time: float) -> None:
         """Per-step ``Step …`` success line. Multi-env runs append an indented ``╰─`` line per env.
         ``Error`` is the sink-level rate (errored arrivals / total arrivals, over the full window);
-        the quality metrics are over the effective (clean, trained-on) subset; ``Trainable`` is
-        relative to all generated rollouts."""
+        the quality metrics are over the effective (clean, trained-on) subset; ``Signal`` counts
+        rollouts with any loss-carrying component, including OPD ref-KL/CE weights."""
         rollouts = batch.rollouts
         effective = rollouts.effective
         eff = effective.metrics
         n_generated = len(rollouts)
-        n_trainable = sum(1 for r in rollouts if r.is_trainable)
-        trainable_rate = (n_trainable / n_generated) if n_generated else 0.0
+        n_signal = sum(1 for r in rollouts if _rollout_training_signal_kind(r) is not None)
+        signal_rate = (n_signal / n_generated) if n_generated else 0.0
         max_off_policy = max((r.off_policy_steps for r in effective), default=0)
 
         head = (
             f"Step {step} | {format_time(step_time):>7} | Reward {eff.reward.mean():.4f} | "
-            f"Trainable {n_trainable}/{n_generated} ({trainable_rate:.1%}) | "
+            f"Signal {n_signal}/{n_generated} ({signal_rate:.1%}) | "
             f"Turns {eff.num_turns.mean():.1f} | Branches {eff.num_branches.mean():.1f} | "
             f"Max Off-Policy {max_off_policy} | "
             f"Error {rollouts.metrics.has_error.mean():.1%} | Truncation {eff.is_truncated.mean():.1%}"
