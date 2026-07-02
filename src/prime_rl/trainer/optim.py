@@ -1,8 +1,10 @@
 import copy
+import os
 import time
 from typing import Callable
 
 import torch
+import dion.muon as dion_muon
 from dion import Muon
 from torch import nn
 from torch.distributed.tensor import DTensor
@@ -14,6 +16,59 @@ from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.trainer.sign_sgd import SignSGD
 from prime_rl.trainer.world import get_world
 from prime_rl.utils.logger import get_logger
+
+
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _maybe_patch_dion_muon_runtime() -> None:
+    """Apply runtime-safe Dion Muon controls for large FSDP smoke tests.
+
+    Dion's Muon implementation compiles several helper kernels on the first
+    optimizer step and also overlaps multiple collective tasks by default. On
+    very large FSDP2 models this can make the first optimizer step look hung or
+    can expose collective ordering issues. These env controls let us isolate
+    the optimizer without changing the model/training config surface.
+    """
+
+    logger = get_logger()
+
+    if _parse_bool_env("PRIME_RL_DION_MUON_EAGER", False):
+        patched = []
+        for name in (
+            "muon_update_pre_orthogonalize",
+            "muon_update_post_orthogonalize",
+            "zeropower_via_newtonschulz5",
+        ):
+            fn = getattr(dion_muon, name, None)
+            original = getattr(fn, "_torchdynamo_orig_callable", None)
+            if original is not None:
+                setattr(dion_muon, name, original)
+                patched.append(name)
+        if patched:
+            logger.warning(f"Running Dion Muon helper kernels in eager mode: {', '.join(patched)}")
+
+    max_tasks = os.environ.get("PRIME_RL_DION_MUON_MAX_CONCURRENT_TASKS")
+    if max_tasks:
+        try:
+            max_tasks_int = int(max_tasks)
+        except ValueError:
+            raise ValueError("PRIME_RL_DION_MUON_MAX_CONCURRENT_TASKS must be an integer") from None
+        if max_tasks_int <= 0:
+            raise ValueError("PRIME_RL_DION_MUON_MAX_CONCURRENT_TASKS must be positive")
+
+        base_runtime = dion_muon.AsyncRuntime
+
+        class _LimitedAsyncRuntime(base_runtime):
+            def __init__(self, task_gen, max_concurrent_tasks: int):
+                super().__init__(task_gen, max_concurrent_tasks=max_tasks_int)
+
+        dion_muon.AsyncRuntime = _LimitedAsyncRuntime
+        logger.warning(f"Limiting Dion Muon async runtime to {max_tasks_int} concurrent task(s)")
 
 
 class CPUOffloadOptimizer:
@@ -186,6 +241,8 @@ def _create_muon_optimizer(
     parallel_dims: ParallelDims,
     lr: float | None = None,
 ) -> Optimizer:
+    _maybe_patch_dion_muon_runtime()
+
     def muon_enabled(n, p):
         if p.ndim < 2:
             return False
