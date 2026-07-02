@@ -57,7 +57,7 @@ def assert_sink_grad_nonzero(model: torch.nn.Module, logger, *, context: str = "
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
     if rank == 0:
         logger.info(
-            "%s sink-gradient canary passed: sink_params=%d nonzero_grad_params=%d grad_abs_sum=%.6e",
+            "{} sink-gradient canary passed: sink_params={} nonzero_grad_params={} grad_abs_sum={:.6e}",
             context,
             found.item(),
             nonzero.item(),
