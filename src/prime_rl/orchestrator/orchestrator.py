@@ -96,6 +96,30 @@ SHUTDOWN_TIMEOUT_S = 300
 MAX_CONSECUTIVE_EMPTY_BATCHES = 10
 
 
+def _nonzero_weight_stream(weights: list[float] | None) -> bool:
+    return weights is not None and any(float(weight) != 0.0 for weight in weights)
+
+
+def _rollout_training_signal_kind(rollout: Rollout) -> str | None:
+    """Return the component that can train this rollout.
+
+    GRPO uses nonzero advantages, but OPD deliberately has no advantages and
+    trains with ref-KL token weights. Keep the low-signal warning aligned with
+    the actual loss routing instead of treating all OPD rollouts as unusable.
+    """
+
+    if rollout.is_trainable:
+        return "rl"
+    for sample in rollout.samples:
+        if _nonzero_weight_stream(sample.ref_kl_weights):
+            return "ref_kl"
+        if _nonzero_weight_stream(sample.ce_weights):
+            return "ce"
+        if _nonzero_weight_stream(sample.rl_weights):
+            return "rl_weights"
+    return None
+
+
 class Orchestrator:
     # Set in ``__init__``
     config: OrchestratorConfig
@@ -502,10 +526,11 @@ class Orchestrator:
                 )
             return
         self.consecutive_empty_batches = 0
-        n_trainable = sum(1 for r in batch.rollouts if r.is_trainable)
+        signal_kinds = [_rollout_training_signal_kind(r) for r in batch.rollouts]
+        n_trainable = sum(1 for kind in signal_kinds if kind is not None)
         if n_trainable / len(batch.rollouts) <= 0.1:
             get_logger().warning(
-                f"Only {n_trainable}/{len(batch.rollouts)} generated rollouts are trainable "
+                f"Only {n_trainable}/{len(batch.rollouts)} generated rollouts carry training signal "
                 f"({n_trainable / len(batch.rollouts):.1%}) — consider reviewing task difficulty / filter config"
             )
 

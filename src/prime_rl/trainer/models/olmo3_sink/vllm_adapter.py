@@ -347,7 +347,9 @@ class Olmo3SinkForCausalLM(nn.Module):
                     if param is None:
                         continue
                     shard = weight.narrow(0, head_start, heads_per_rank)
-                    param.data.copy_(shard.to(device=param.device, dtype=param.dtype))
+                    shard = shard.to(dtype=param.dtype)
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, shard)
                     loaded_sinks.add(name)
                     continue
                 yield name, weight

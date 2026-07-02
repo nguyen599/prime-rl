@@ -9,6 +9,39 @@ from vllm.model_executor.model_loader.reload import finalize_layerwise_reload, i
 logger = init_logger("vllm.inference.vllm.worker_weight_transfer")
 
 
+def _restore_static_rotary_reload_modules(model: Module) -> None:
+    """Keep vLLM layerwise reload quiet for static RoPE buffers.
+
+    OLMo3/OLMo3Sink checkpoints do not contain RoPE buffers such as
+    ``inv_freq``. During a policy weight refresh vLLM temporarily moves every
+    module to meta tensors; if a module has only static buffers, layerwise
+    reload later logs "Failed to load weights" even though restoring the
+    previous kernel buffers is the correct behavior.
+    """
+
+    try:
+        from vllm.model_executor.model_loader.reload.layerwise import (
+            _place_kernel_tensors,
+            get_layerwise_info,
+        )
+    except Exception:
+        return
+
+    for module in model.modules():
+        if module.__class__.__name__ not in {"RotaryEmbedding", "YaRNScalingRotaryEmbedding"}:
+            continue
+        info = get_layerwise_info(module)
+        if not info.can_load() or info.kernel_tensors is None:
+            continue
+        if info.load_numel != 0 or not info.load_numel_total:
+            continue
+        parameters, _ = info.kernel_tensors
+        if parameters:
+            continue
+        _place_kernel_tensors(module, info)
+        info.reset()
+
+
 def load_weights_checkpoint_layerwise(
     model: Module,
     state_iter: Iterable[tuple[str, torch.Tensor]],
@@ -20,6 +53,7 @@ def load_weights_checkpoint_layerwise(
     with torch.device(device), set_current_vllm_config(vllm_config):
         initialize_layerwise_reload(model)
         model.load_weights(state_iter)  # type: ignore
+        _restore_static_rotary_reload_modules(model)
         finalize_layerwise_reload(model, model_config)
 
 
