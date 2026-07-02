@@ -38,6 +38,7 @@ from collections.abc import Callable
 
 import torch
 import torch.nn as nn
+from torch import Tensor
 
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
@@ -101,6 +102,7 @@ def eager_attention_forward_with_sink(
 from transformers.utils.generic import TransformersKwargs
 
 from .configuration_olmo3_sink import Olmo3SinkConfig
+from .converting_olmo3_sink import convert_layer_to_vllm_kernel
 
 
 # OLMo 3 RoPE is identical to the stock rotary embedding, except:
@@ -210,6 +212,39 @@ class Olmo3SinkPreTrainedModel(Olmo3PreTrainedModel):
         """Mirror Prime-RL model classes, which call `from_config()` on meta."""
         kwargs.pop("trust_remote_code", None)
         return cls._from_config(config, **kwargs)
+
+    @classmethod
+    def is_hf_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:
+        return True
+
+    @classmethod
+    def is_prime_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:
+        return True
+
+    @classmethod
+    def convert_to_hf(cls, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+        return state_dict
+
+    @classmethod
+    def convert_to_prime(cls, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+        return state_dict
+
+    @classmethod
+    def convert_layer_to_hf(cls, state_dict: dict[str, Tensor], layer_idx: int) -> dict[str, Tensor]:
+        return state_dict
+
+    @classmethod
+    def convert_layer_to_prime(cls, state_dict: dict[str, Tensor], layer_idx: int) -> dict[str, Tensor]:
+        return state_dict
+
+    @classmethod
+    def convert_layer_to_vllm_kernel(
+        cls,
+        state_dict: dict[str, Tensor],
+        layer_idx: int,
+        quantize_fp8: bool = False,
+    ) -> dict[str, Tensor]:
+        return convert_layer_to_vllm_kernel(state_dict, layer_idx, quantize_fp8=quantize_fp8)
 
     def _init_weights(self, module):
         super()._init_weights(module)

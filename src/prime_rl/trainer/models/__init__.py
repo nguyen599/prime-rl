@@ -52,9 +52,7 @@ _CUSTOM_CAUSAL_LM_MAPPING.register(NemotronHConfig, NemotronHForCausalLM, exist_
 _CUSTOM_CAUSAL_LM_MAPPING.register(Qwen3MoeConfig, Qwen3MoeForCausalLM, exist_ok=True)
 _CUSTOM_CAUSAL_LM_MAPPING.register(Qwen3_5MoeConfig, Qwen3_5MoeForCausalLM, exist_ok=True)
 _CUSTOM_CAUSAL_LM_MAPPING.register(GptOssConfig, GptOssForCausalLM, exist_ok=True)
-# Olmo3Sink intentionally stays out of the PrimeRL custom mapping for now.
-# It loads through the Hugging Face path, while vLLM uses the adapter registered
-# from prime_rl.inference.patches.
+_CUSTOM_CAUSAL_LM_MAPPING.register(Olmo3SinkConfig, Olmo3SinkForCausalLM, exist_ok=True)
 
 
 class AutoModelForCausalLMPrimeRL(_BaseAutoModelClass):
