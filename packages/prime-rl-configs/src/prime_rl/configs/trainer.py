@@ -18,7 +18,14 @@ from prime_rl.utils.config import BaseConfig
 
 # -- Shared trainer configs (used by both SFT and RL trainers) --
 
-AttnImplementation: TypeAlias = Literal["eager", "sdpa", "flash_attention_2", "flash_attention_3", "fa4"]
+AttnImplementation: TypeAlias = Literal[
+    "eager",
+    "sdpa",
+    "flash_attention_2",
+    "flash_attention_3",
+    "fa4",
+    "olmo3_sink_fa3",
+]
 EPCommBackend: TypeAlias = Literal["torch", "deepep"]
 
 # User-facing name -> internal name. Users set `flash_attention_4` in configs,
@@ -121,7 +128,7 @@ class ModelConfig(BaseModelConfig):
     """Sequence length the model is trained on."""
 
     attn: AttnImplementation = "flash_attention_2"
-    """Attention implementation. With CP enabled, ring attention uses the matching kernel family (FA2/FA3/FA4)."""
+    """Attention implementation. With CP enabled, ring attention uses the matching kernel family (FA2/FA3/FA4); Olmo3Sink uses its sink-aware FA3 adapter."""
 
     compile: CompileConfig | None = CompileConfig()
     """Compile the model with ``torch.compile``."""
@@ -210,9 +217,9 @@ class ModelConfig(BaseModelConfig):
 
     @model_validator(mode="after")
     def cp_only_with_flash_attn(self):
-        if self.cp > 1 and self.attn not in ["flash_attention_2", "flash_attention_3", "fa4"]:
-            raise ValueError("CP is only supported with flash attention 2, flash attention 3, or fa4")
-        if self.cp > 1 and self.attn in ("flash_attention_3", "fa4") and self.impl != "custom":
+        if self.cp > 1 and self.attn not in ["flash_attention_2", "flash_attention_3", "fa4", "olmo3_sink_fa3"]:
+            raise ValueError("CP is only supported with flash attention 2, flash attention 3, fa4, or olmo3_sink_fa3")
+        if self.cp > 1 and self.attn in ("flash_attention_3", "fa4", "olmo3_sink_fa3") and self.impl != "custom":
             # Both ring and ulysses route FA3/FA4 through our custom FlashAttention class:
             # ring patches `_compute_attention` with the ring kernel, ulysses patches it with
             # the all-to-all wrapper around the FA3/FA4 kernel. The HF path patches
