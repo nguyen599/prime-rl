@@ -8,6 +8,7 @@
                 "configuration",
                 "training",
                 "inference",
+                "olmo3-sink",
                 "scaling",
                 "algorithms",
                 "advanced",
