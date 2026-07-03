@@ -3,7 +3,6 @@ import os
 
 from prime_rl.inference.patches import (
     monkey_patch_fp32_lm_head,
-    monkey_patch_LRUCacheWorkerLoRAManager,
     monkey_patch_minimax_m2_for_lora,
     monkey_patch_no_moe_lora,
     monkey_patch_skip_lora_module_warnings,
