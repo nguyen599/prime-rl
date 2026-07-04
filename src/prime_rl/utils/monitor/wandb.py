@@ -215,22 +215,11 @@ class WandbMonitor(Monitor):
                     log_mode="INCREMENTAL",
                 )
                 self.tokenizer = tokenizer
-                self.eval_samples_cols = [
-                    "step",
-                    "env",
-                    "task",
-                    "task_idx",
-                    "completion",
-                    "reward",
-                    "task_type",
-                    "gold_answer",
-                    "boxed_answer",
-                    "verifiable_accuracy",
-                    "answer_match_method",
-                    "proof_opd_trace",
-                ]
-                self.eval_samples_rows: list[list[Any]] = []
-                self.eval_samples_table = wandb.Table(columns=self.eval_samples_cols)
+                self.eval_samples_cols = ["step", "env", "task", "task_idx", "completion", "reward"]
+                self.eval_samples_table = wandb.Table(
+                    columns=self.eval_samples_cols,
+                    log_mode="INCREMENTAL",
+                )
 
     def _maybe_overwrite_wandb_command(self) -> None:
         """Overwrites sys.argv with the start command if it is set in the environment variables."""
@@ -328,7 +317,6 @@ class WandbMonitor(Monitor):
         ):
             return
 
-        batch_rows: list[list[Any]] = []
         for rollout in rollouts:
             trace = rollout
             for branch in trace.branches:
@@ -337,7 +325,6 @@ class WandbMonitor(Monitor):
                 completion = "".join(m.content or "" for m in branch.messages if m.role == "assistant")
                 if not completion:
                     continue
-                proof_trace = _proof_opd_trace(rollout)
                 sample = {
                     "step": step,
                     "env": env_name,
@@ -345,37 +332,10 @@ class WandbMonitor(Monitor):
                     "task_idx": trace.task.idx,
                     "completion": completion,
                     "reward": trace.reward,
-                    "task_type": proof_trace.get("task_type", ""),
-                    "gold_answer": proof_trace.get("gold_answer", ""),
-                    "boxed_answer": proof_trace.get("boxed_answer", ""),
-                    "verifiable_accuracy": proof_trace.get("verifiable_accuracy", ""),
-                    "answer_match_method": proof_trace.get("answer_match_method", ""),
-                    "proof_opd_trace": _json_table_cell(proof_trace) if proof_trace else "",
                 }
-                assert list(sample.keys()) == self.eval_samples_cols, (
-                    "Order of columns in the eval table must be the same as order of the keys here"
-                )
-                batch_rows.append(list(sample.values()))
+                self.eval_samples_table.add_data(*sample.values())
 
-        if not batch_rows:
-            return
-
-        self.eval_samples_rows.extend(batch_rows)
-        self.eval_samples_table = wandb.Table(columns=self.eval_samples_cols, data=self.eval_samples_rows)
-        step_table = wandb.Table(columns=self.eval_samples_cols, data=batch_rows)
-        self.logger.info(
-            "Logging %d eval samples to W&B table at step %d (%d cumulative rows)",
-            len(batch_rows),
-            step,
-            len(self.eval_samples_rows),
-        )
-        wandb.log(
-            {
-                "eval/samples": self.eval_samples_table,
-                f"eval/samples_step_{step:08d}": step_table,
-                "step": step,
-            }
-        )
+        wandb.log({"eval/samples": self.eval_samples_table, "step": step})
 
     def log_distributions(self, distributions: dict[str, list[float]], step: int) -> None:
         """Log distributions (no-op for W&B)."""
