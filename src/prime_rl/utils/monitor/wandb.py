@@ -131,6 +131,20 @@ def _task_answer_payload(rollout) -> dict[str, Any]:
     return loaded if isinstance(loaded, dict) else {}
 
 
+def _is_proof_opd_rollout(rollout) -> bool:
+    env_name = str(getattr(rollout, "env_name", "") or "").lower()
+    if env_name.startswith("proof_math") or "proof_opd" in env_name:
+        return True
+
+    metrics = getattr(rollout, "metrics", {}) or {}
+    if any(str(key).startswith("proof_opd_") for key in metrics):
+        return True
+
+    answer = _task_answer_payload(rollout)
+    task_type = str(answer.get("task_type") or "").lower()
+    return task_type in {"proof", "verifiable"} and ("problem" in answer or "gold_answer" in answer)
+
+
 def _classify_proof_opd_stage(prompt: str) -> str:
     text = prompt.lower()
     if "candidate solution(s) to refine" in text or "provide a better solution" in text:
@@ -151,6 +165,9 @@ def _previous_user_prompt(nodes: list[Any], index: int) -> str:
 
 
 def _fallback_proof_opd_trace(rollout, branch=None) -> dict[str, Any]:
+    if not _is_proof_opd_rollout(rollout):
+        return {}
+
     branches = getattr(rollout, "branches", [])
     if branch is None:
         branch = branches[-1] if branches else None
