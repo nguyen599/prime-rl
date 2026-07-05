@@ -50,12 +50,194 @@ def _json_table_cell(value: Any) -> str:
         return json.dumps(str(value), ensure_ascii=False)
 
 
-def _proof_opd_trace(rollout) -> dict[str, Any]:
-    info = getattr(rollout, "info", None)
-    if not isinstance(info, dict):
+def _message_content_to_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, Sequence) and not isinstance(content, (bytes, bytearray, str)):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text") or item.get("content") or ""))
+            else:
+                parts.append(str(getattr(item, "text", "") or getattr(item, "content", "") or item))
+        return "\n".join(part for part in parts if part)
+    return str(content)
+
+
+def _message_text(message: Any) -> str:
+    reasoning = _message_content_to_text(getattr(message, "reasoning_content", None)).strip()
+    content = _message_content_to_text(getattr(message, "content", None)).strip()
+    if reasoning:
+        return f"{reasoning}\n\n{content}".strip() if content else reasoning
+    return content
+
+
+def _message_role(message: Any) -> str:
+    role = getattr(message, "role", None)
+    if role:
+        return str(role)
+    name = type(message).__name__.lower()
+    if "assistant" in name:
+        return "assistant"
+    if "user" in name:
+        return "user"
+    if "system" in name:
+        return "system"
+    if "tool" in name:
+        return "tool"
+    return name
+
+
+def _clip_proof_trace_text(value: Any) -> str:
+    text = str(value or "")
+    limit_text = os.environ.get("PRIME_WANDB_PROOF_OPD_TEXT_CHARS", "4000000").strip()
+    try:
+        limit = int(limit_text)
+    except ValueError:
+        limit = 4_000_000
+    if limit <= 0 or len(text) <= limit:
+        return text
+    half = max(0, limit // 2)
+    return text[:half] + f"\n...[clipped {len(text) - limit} chars]...\n" + text[-half:]
+
+
+def _json_loads_maybe(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def _task_record(rollout) -> dict[str, Any]:
+    task = getattr(rollout, "task", None)
+    if task is None:
         return {}
-    trace = info.get("proof_opd_trace")
-    return trace if isinstance(trace, dict) else {}
+    if hasattr(task, "model_dump"):
+        try:
+            record = task.model_dump(mode="json")
+            return record if isinstance(record, dict) else {}
+        except Exception:
+            return {}
+    return task if isinstance(task, dict) else {}
+
+
+def _task_answer_payload(rollout) -> dict[str, Any]:
+    answer = _task_record(rollout).get("answer")
+    loaded = _json_loads_maybe(answer)
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _classify_proof_opd_stage(prompt: str) -> str:
+    text = prompt.lower()
+    if "candidate solution(s) to refine" in text or "provide a better solution" in text:
+        return "refine"
+    if 'solution evaluation' in text and "assess whether" in text:
+        return "meta"
+    if "evaluate the quality of a solution" in text:
+        return "verifier"
+    return "proof"
+
+
+def _previous_user_prompt(nodes: list[Any], index: int) -> str:
+    for node in reversed(nodes[:index]):
+        message = getattr(node, "message", None)
+        if _message_role(message) == "user":
+            return _message_text(message)
+    return ""
+
+
+def _fallback_proof_opd_trace(rollout, branch=None) -> dict[str, Any]:
+    branches = getattr(rollout, "branches", [])
+    if branch is None:
+        branch = branches[-1] if branches else None
+    nodes = list(getattr(branch, "nodes", []) or [])
+    if not nodes:
+        return {}
+
+    answer = _task_answer_payload(rollout)
+    task_record = _task_record(rollout)
+    metrics = getattr(rollout, "metrics", {}) or {}
+    task_type = str(answer.get("task_type") or "").strip()
+    if not task_type:
+        task_type = "verifiable" if float(metrics.get("proof_opd_task_is_verifiable", 0.0) or 0.0) > 0.5 else "proof"
+
+    stage_records: list[dict[str, Any]] = []
+    current_round = 0
+    verifier_counts: dict[int, int] = {0: 0}
+    for index, node in enumerate(nodes):
+        if not bool(getattr(node, "sampled", False)):
+            continue
+        message = getattr(node, "message", None)
+        if _message_role(message) != "assistant":
+            continue
+        prompt = _previous_user_prompt(nodes, index)
+        stage = _classify_proof_opd_stage(prompt)
+        if stage == "refine":
+            current_round += 1
+            verifier_counts.setdefault(current_round, 0)
+            verify_index = 0
+        elif stage == "verifier":
+            verify_index = verifier_counts.get(current_round, 0)
+            verifier_counts[current_round] = verify_index + 1
+        elif stage == "meta":
+            verify_index = max(0, verifier_counts.get(current_round, 1) - 1)
+        else:
+            current_round = 0
+            verifier_counts.setdefault(current_round, 0)
+            verify_index = 0
+        output = _message_text(message)
+        stage_records.append(
+            {
+                "stage": stage,
+                "round_index": current_round,
+                "verify_index": verify_index,
+                "raw_chars": len(output),
+                "raw_output_excerpt": _clip_proof_trace_text(output),
+                "prompt_excerpt": _clip_proof_trace_text(prompt),
+                "closed_thinking": "</think>" in output.lower(),
+                "finish_reason": str(getattr(node, "finish_reason", "") or ""),
+                "source": "wandb_monitor_fallback",
+            }
+        )
+
+    if not stage_records:
+        return {}
+
+    gold_answer = str(answer.get("gold_answer") or task_record.get("gold_answer") or "")
+    verifiable_accuracy = metrics.get("proof_opd_verifiable_accuracy", -1.0)
+    answer_match_method_id = metrics.get("proof_opd_answer_match_method", -1.0)
+    return {
+        "task_id": task_record.get("task_id") or answer.get("task_id"),
+        "source_index": task_record.get("source_index"),
+        "task_type": task_type,
+        "problem": answer.get("problem") or task_record.get("problem") or task_record.get("prompt", ""),
+        "gold_answer": gold_answer,
+        "boxed_answer": "",
+        "boxed_present": metrics.get("proof_opd_boxed_present", 0.0),
+        "verifiable_accuracy": verifiable_accuracy,
+        "answer_match_method": "unknown_fallback" if task_type == "verifiable" else "not_verifiable",
+        "answer_match_method_id": answer_match_method_id,
+        "reward": getattr(rollout, "reward", 0.0),
+        "format_score": metrics.get("proof_opd_format_score"),
+        "proof_score": metrics.get("proof_opd_proof_score"),
+        "meta_score": metrics.get("proof_opd_meta_score"),
+        "selected_round_index": metrics.get("proof_opd_round_index"),
+        "stage_records": stage_records,
+        "reason": "fallback_from_rollout_message_nodes",
+    }
+
+
+def _proof_opd_trace(rollout, branch=None) -> dict[str, Any]:
+    info = getattr(rollout, "info", None)
+    if isinstance(info, dict):
+        trace = info.get("proof_opd_trace")
+        if isinstance(trace, dict):
+            return trace
+    return _fallback_proof_opd_trace(rollout, branch)
 
 
 def _sample_proof_opd_rollouts(rollouts: list, default_sampled: list) -> list:
@@ -280,7 +462,7 @@ class WandbMonitor(Monitor):
                 token_ids = branch.token_ids
                 if not token_ids:
                     continue
-                proof_trace = _proof_opd_trace(rollout)
+                proof_trace = _proof_opd_trace(rollout, branch)
                 sample = {
                     "step": step,
                     "env_name": rollout.env_name,

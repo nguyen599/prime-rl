@@ -602,7 +602,10 @@ class Orchestrator:
                 metrics[f"pre_filters/all/{name}/rate"] = count / self.train_sink.pre_filter_seen
         self.monitor.log(metrics, step=step)
         self.wait_for_policy_time = 0.0
-        self.monitor.log_samples(effective.rollouts, step=step)
+        # Sample tables are for debugging generation quality, so keep the full
+        # generated cohort here instead of only the effective trainer-bound
+        # subset. This preserves zero-reward / filtered traces for inspection.
+        self.monitor.log_samples(batch.rollouts, step=step)
         self.monitor.log_distributions(
             distributions={
                 "rewards": [r.reward for r in effective],
