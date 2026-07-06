@@ -243,6 +243,19 @@ class OPDAlgoConfig(BaseAlgoConfig):
 
     action_loss_type: ClassVar[ActionLossType] = "ref_kl"
 
+    distill_mode: Literal["token_logprobs", "full_vocab_hidden"] = "token_logprobs"
+    """Teacher signal used for OPD.
+
+    ``token_logprobs`` is the legacy/default path and ships one scalar teacher
+    logprob per token. ``full_vocab_hidden`` asks the teacher endpoint for last
+    hidden states so the trainer can reconstruct full-vocab teacher logits with
+    the teacher LM head.
+    """
+
+    teacher_hidden_dtype: Literal["float16", "bfloat16", "float32"] = "float16"
+    """dtype requested from the teacher hidden-state scorer when
+    ``distill_mode='full_vocab_hidden'``."""
+
     teacher: FrozenModelConfig
     """The teacher — an inline frozen hosted model (``name`` + ``base_url``)
     whose reverse KL the policy distills toward. Required, and necessarily a

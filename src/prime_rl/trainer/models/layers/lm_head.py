@@ -20,6 +20,8 @@ class PrimeLmOutput(TypedDict, total=False):
     logprobs: Tensor | None
     entropy: Tensor | None
     loss: Tensor | None
+    full_vocab_ref_kl_loss: Tensor | None
+    full_vocab_ref_kl: Tensor | None
 
 
 def cast_float_and_contiguous(output: PrimeLmOutput) -> PrimeLmOutput:
@@ -33,7 +35,131 @@ def cast_float_and_contiguous(output: PrimeLmOutput) -> PrimeLmOutput:
         logprobs=_float_and_contiguous(output.get("logprobs")),
         entropy=_float_and_contiguous(output.get("entropy")),
         loss=output.get("loss"),
+        full_vocab_ref_kl_loss=output.get("full_vocab_ref_kl_loss"),
+        full_vocab_ref_kl=_float_and_contiguous(output.get("full_vocab_ref_kl")),
     )
+
+
+def _chunked_full_vocab_reverse_kl(
+    student_hidden: Tensor,
+    teacher_hidden: Tensor,
+    student_weight: Tensor,
+    teacher_weight: Tensor,
+    mask: Tensor,
+    weights: Tensor | None,
+    inv_temperature: Tensor,
+    token_chunk_size: int,
+    vocab_chunk_size: int,
+) -> tuple[Tensor, Tensor]:
+    """Compute weighted KL(P_student || P_teacher) without materializing [N,V].
+
+    ``student_hidden`` and ``teacher_hidden`` are aligned hidden states for the
+    same next-token distributions. ``mask`` selects the token rows that
+    participate in the ref-KL component.
+    """
+    b, s, student_h = student_hidden.shape
+    if teacher_hidden.shape[:2] != (b, s):
+        raise ValueError(
+            "teacher_hidden must align with student_hidden on batch/sequence dimensions: "
+            f"student={tuple(student_hidden.shape)} teacher={tuple(teacher_hidden.shape)}"
+        )
+    teacher_h = teacher_hidden.shape[-1]
+    if student_weight.dim() != 2 or student_weight.shape[1] != student_h:
+        raise ValueError(
+            f"student_weight shape {tuple(student_weight.shape)} is incompatible with student hidden size {student_h}"
+        )
+    if teacher_weight.dim() != 2 or teacher_weight.shape[1] != teacher_h:
+        raise ValueError(
+            f"teacher_weight shape {tuple(teacher_weight.shape)} is incompatible with teacher hidden size {teacher_h}"
+        )
+    if student_weight.shape[0] != teacher_weight.shape[0]:
+        raise ValueError(
+            "full-vocab OPD requires aligned student/teacher vocabularies: "
+            f"student_vocab={student_weight.shape[0]} teacher_vocab={teacher_weight.shape[0]}"
+        )
+    flat_mask = mask.reshape(b * s).to(torch.bool)
+    if not bool(flat_mask.any()):
+        zero = student_hidden.sum() * 0.0
+        return zero, zero.detach()
+
+    s_hidden = student_hidden.reshape(b * s, student_h)[flat_mask].contiguous()
+    t_hidden = (
+        teacher_hidden.reshape(b * s, teacher_h)[flat_mask]
+        .to(device=s_hidden.device, dtype=s_hidden.dtype)
+        .contiguous()
+    )
+    selected_inv_t = inv_temperature.reshape(b * s)[flat_mask].to(device=s_hidden.device, dtype=torch.float32)
+    if weights is None:
+        selected_weights = torch.ones((s_hidden.shape[0],), device=s_hidden.device, dtype=torch.float32)
+    else:
+        selected_weights = weights.reshape(b * s)[flat_mask].to(device=s_hidden.device, dtype=torch.float32)
+
+    teacher_weight = teacher_weight.detach().to(device=s_hidden.device, dtype=s_hidden.dtype)
+    vocab = student_weight.shape[0]
+    token_chunk_size = max(1, int(token_chunk_size))
+    vocab_chunk_size = max(1, int(vocab_chunk_size))
+    total_loss = s_hidden.sum() * 0.0
+    metric_values: list[Tensor] = []
+
+    for token_start in range(0, s_hidden.shape[0], token_chunk_size):
+        token_end = min(token_start + token_chunk_size, s_hidden.shape[0])
+        s_chunk = s_hidden[token_start:token_end]
+        t_chunk = t_hidden[token_start:token_end]
+        w_chunk = selected_weights[token_start:token_end]
+
+        s_m: Tensor | None = None
+        s_sum: Tensor | None = None
+        with torch.no_grad():
+            t_m: Tensor | None = None
+            t_sum: Tensor | None = None
+            for vocab_start in range(0, vocab, vocab_chunk_size):
+                vocab_end = min(vocab_start + vocab_chunk_size, vocab)
+                t_logits = (t_chunk @ teacher_weight[vocab_start:vocab_end].t()).to(torch.float32)
+                t_chunk_m = torch.amax(t_logits, dim=-1)
+                if t_m is None:
+                    t_m = t_chunk_m
+                    t_sum = torch.exp(t_logits - t_m.unsqueeze(-1)).sum(dim=-1)
+                else:
+                    t_m_new = torch.maximum(t_m, t_chunk_m)
+                    t_sum = t_sum * torch.exp(t_m - t_m_new) + torch.exp(t_logits - t_m_new.unsqueeze(-1)).sum(dim=-1)
+                    t_m = t_m_new
+            assert t_m is not None and t_sum is not None
+            t_logz = t_m + torch.log(t_sum)
+
+        for vocab_start in range(0, vocab, vocab_chunk_size):
+            vocab_end = min(vocab_start + vocab_chunk_size, vocab)
+            s_logits = (s_chunk @ student_weight[vocab_start:vocab_end].t()).to(torch.float32) * selected_inv_t[
+                token_start:token_end
+            ].unsqueeze(-1)
+            s_chunk_m = torch.amax(s_logits, dim=-1)
+            if s_m is None:
+                s_m = s_chunk_m
+                s_sum = torch.exp(s_logits - s_m.unsqueeze(-1)).sum(dim=-1)
+            else:
+                s_m_new = torch.maximum(s_m, s_chunk_m)
+                s_sum = s_sum * torch.exp(s_m - s_m_new) + torch.exp(s_logits - s_m_new.unsqueeze(-1)).sum(dim=-1)
+                s_m = s_m_new
+        assert s_m is not None and s_sum is not None
+        s_logz = s_m + torch.log(s_sum)
+
+        kl_chunk = torch.zeros((token_end - token_start,), device=s_hidden.device, dtype=torch.float32)
+        for vocab_start in range(0, vocab, vocab_chunk_size):
+            vocab_end = min(vocab_start + vocab_chunk_size, vocab)
+            s_logits = (s_chunk @ student_weight[vocab_start:vocab_end].t()).to(torch.float32) * selected_inv_t[
+                token_start:token_end
+            ].unsqueeze(-1)
+            with torch.no_grad():
+                t_logits = (t_chunk @ teacher_weight[vocab_start:vocab_end].t()).to(torch.float32)
+                t_logp = t_logits - t_logz.unsqueeze(-1)
+            s_logp = s_logits - s_logz.unsqueeze(-1)
+            s_probs = torch.exp(s_logp)
+            kl_chunk = kl_chunk + (s_probs * (s_logp - t_logp)).sum(dim=-1)
+
+        total_loss = total_loss + (kl_chunk * w_chunk).sum()
+        metric_values.append(kl_chunk.detach())
+
+    metric = torch.cat(metric_values).mean() if metric_values else total_loss.detach()
+    return total_loss, metric
 
 
 class FusedOutputLinear(torch.nn.Linear):
@@ -46,6 +172,12 @@ class FusedOutputLinear(torch.nn.Linear):
         hidden_states: torch.Tensor,
         labels: torch.Tensor | None = None,
         temperature: Tensor | None = None,
+        teacher_hidden_states: Tensor | None = None,
+        teacher_lm_head_weight: Tensor | None = None,
+        full_vocab_ref_kl_mask: Tensor | None = None,
+        full_vocab_ref_kl_weights: Tensor | None = None,
+        full_vocab_token_chunk_size: int = 64,
+        full_vocab_vocab_chunk_size: int = 8192,
     ) -> PrimeLmOutput:
         assert labels is not None, "FusedOutputLinear requires labels for chunked logprob computation"
         assert temperature is not None, "FusedOutputLinear requires per-token temperatures"
@@ -61,7 +193,26 @@ class FusedOutputLinear(torch.nn.Linear):
 
         logprobs = logprobs.reshape(b, s)
         entropy = entropy.reshape(b, s)
-        return PrimeLmOutput(logprobs=logprobs, entropy=entropy)
+        output = PrimeLmOutput(logprobs=logprobs, entropy=entropy)
+        if teacher_hidden_states is not None:
+            if teacher_lm_head_weight is None or full_vocab_ref_kl_mask is None:
+                raise ValueError(
+                    "teacher_lm_head_weight and full_vocab_ref_kl_mask are required with teacher_hidden_states"
+                )
+            full_vocab_loss, full_vocab_metric = _chunked_full_vocab_reverse_kl(
+                hidden_states.reshape(b, s, h),
+                teacher_hidden_states,
+                self.weight,
+                teacher_lm_head_weight,
+                full_vocab_ref_kl_mask,
+                full_vocab_ref_kl_weights,
+                inv_t.reshape(b, s),
+                full_vocab_token_chunk_size,
+                full_vocab_vocab_chunk_size,
+            )
+            output["full_vocab_ref_kl_loss"] = full_vocab_loss
+            output["full_vocab_ref_kl"] = full_vocab_metric
+        return output
 
 
 class VanillaOutputLinear(torch.nn.Linear):
@@ -353,6 +504,12 @@ def _patch_model_forward(model: nn.Module) -> None:
         labels: torch.Tensor | None = None,
         logits_to_keep: int = 0,
         temperature: torch.Tensor | None = None,
+        teacher_hidden_states: torch.Tensor | None = None,
+        teacher_lm_head_weight: torch.Tensor | None = None,
+        full_vocab_ref_kl_mask: torch.Tensor | None = None,
+        full_vocab_ref_kl_weights: torch.Tensor | None = None,
+        full_vocab_token_chunk_size: int = 64,
+        full_vocab_vocab_chunk_size: int = 8192,
         **kwargs: object,
     ) -> PrimeLmOutput:
         # For VLM with images, don't create position_ids - let model compute MRoPE internally
@@ -374,10 +531,27 @@ def _patch_model_forward(model: nn.Module) -> None:
         )
 
         # Pass through the wrapped lm_head
+        lm_head_kwargs = {}
+        if teacher_hidden_states is not None:
+            lm_head_kwargs.update(
+                {
+                    "teacher_hidden_states": teacher_hidden_states[:, slice_indices, :],
+                    "teacher_lm_head_weight": teacher_lm_head_weight,
+                    "full_vocab_ref_kl_mask": full_vocab_ref_kl_mask[:, slice_indices]
+                    if full_vocab_ref_kl_mask is not None
+                    else None,
+                    "full_vocab_ref_kl_weights": full_vocab_ref_kl_weights[:, slice_indices]
+                    if full_vocab_ref_kl_weights is not None
+                    else None,
+                    "full_vocab_token_chunk_size": full_vocab_token_chunk_size,
+                    "full_vocab_vocab_chunk_size": full_vocab_vocab_chunk_size,
+                }
+            )
         return self.lm_head(
             hidden_states[:, slice_indices, :],
             labels[:, slice_indices] if labels is not None else None,
             temperature=temperature[:, slice_indices] if temperature is not None else None,
+            **lm_head_kwargs,
         )
 
     # Bind the new forward to the model

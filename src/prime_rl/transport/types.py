@@ -33,6 +33,12 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
     temperatures: list[float]
     env_name: str
     ref_logprobs: list[float] | None = None  # reference-model logprobs (ref_kl component)
+    ref_hidden_states: EncodedTensor | None = None
+    """Reference-model last hidden states aligned with ``token_ids``.
+
+    This is an opt-in OPD signal for full-vocab reverse-KL distillation. The
+    default OPD path still uses ``ref_logprobs`` only.
+    """
 
     # Generic multimodal kwargs: flat dict keyed by the kwarg names the
     # model's forward expects (e.g. {"pixel_values": ..., "image_grid_thw":
@@ -90,6 +96,7 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     temperatures: list[float]  # Per-token temperatures used during generation
     env_names: list[str]
     ref_logprobs: list[float] | None = None
+    ref_hidden_states: EncodedTensor | None = None
     lora_num_tokens: list[int] | None = None
     routed_experts: RoutedExperts | None = None
 

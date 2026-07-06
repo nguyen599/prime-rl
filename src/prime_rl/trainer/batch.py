@@ -59,6 +59,16 @@ def _slice_encoded(tensor: EncodedTensor, n_rows: int) -> EncodedTensor:
     )
 
 
+def _copy_encoded(tensor: EncodedTensor) -> EncodedTensor:
+    return EncodedTensor(dtype=tensor.dtype, shape=list(tensor.shape), data=tensor.data)
+
+
+def _encoded_zero_rows(template: EncodedTensor, n_rows: int) -> bytes:
+    row = int(np.prod(template.shape[1:])) if len(template.shape) > 1 else 1
+    itemsize = np.dtype(template.dtype).itemsize
+    return b"\0" * (n_rows * row * itemsize)
+
+
 def _truncate_mm(
     mm_token_type_ids: list[int], mm_kwargs: dict[str, EncodedTensor], seq_len: int
 ) -> tuple[int, dict[str, EncodedTensor] | None]:
@@ -136,6 +146,11 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     # Ref logprobs already cover the full sequence (prompt + completion),
     # computed via prefill in the orchestrator when the algorithm scores against a reference
     ref_logprobs = training_example.ref_logprobs
+    ref_hidden_states = (
+        _copy_encoded(training_example.ref_hidden_states)
+        if training_example.ref_hidden_states is not None
+        else None
+    )
     routed_experts = (
         _copy_routed_experts(training_example.routed_experts) if training_example.routed_experts is not None else None
     )
@@ -154,6 +169,8 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         temperatures = temperatures[:cut]
         if ref_logprobs is not None:
             ref_logprobs = ref_logprobs[:cut]
+        if ref_hidden_states is not None:
+            ref_hidden_states = _slice_encoded(ref_hidden_states, cut)
         if rl_weights is not None:
             rl_weights = rl_weights[:cut]
         if ce_weights is not None:
@@ -178,6 +195,10 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     )
     if ref_logprobs is not None:
         assert len(ref_logprobs) == len(input_ids), f"ref_logprobs: {len(ref_logprobs)}"
+    if ref_hidden_states is not None:
+        assert ref_hidden_states.shape[0] == len(input_ids), (
+            f"ref_hidden_states: {ref_hidden_states.shape}, input_ids: {len(input_ids)}"
+        )
     for stream_name, stream in (
         ("rl_weights", rl_weights),
         ("ce_weights", ce_weights),
@@ -206,6 +227,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         inference_logprobs=inference_logprobs,
         sequence_lengths=[len(input_ids)],
         ref_logprobs=ref_logprobs,
+        ref_hidden_states=ref_hidden_states,
         temperatures=temperatures,
         routed_experts=routed_experts,
         mm_token_type_ids=mm_token_type_ids,
@@ -276,6 +298,11 @@ class _MicroBatchBin:
 
 def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
     has_ref_logprobs = any(sample.ref_logprobs is not None for _, sample in bin_content.samples)
+    ref_hidden_template = next(
+        (sample.ref_hidden_states for _, sample in bin_content.samples if sample.ref_hidden_states is not None),
+        None,
+    )
+    has_ref_hidden_states = ref_hidden_template is not None
     has_mm_token_type_ids = any(sample.mm_token_type_ids is not None for _, sample in bin_content.samples)
     # A weight stream materializes as soon as one packed sample carries it; the
     # samples that lack it get the stream's identity fill (STREAM_FILL).
@@ -289,6 +316,7 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
     temperatures: list[float] = []
     env_names: list[str] = []
     ref_logprobs: list[float] | None = [] if has_ref_logprobs else None
+    ref_hidden_data = bytearray() if has_ref_hidden_states else None
     mm_token_type_ids: list[int] | None = [] if has_mm_token_type_ids else None
     streams: dict[str, list[float] | None] = {name: ([] if has_stream[name] else None) for name in STREAM_FILL}
     routed_experts: RoutedExperts | None = None
@@ -305,6 +333,21 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
         env_names.extend(sample.env_names)
         if ref_logprobs is not None:
             ref_logprobs.extend(sample.ref_logprobs if sample.ref_logprobs is not None else [0.0] * sample_len)
+        if ref_hidden_data is not None:
+            sample_ref_hidden = sample.ref_hidden_states
+            if sample_ref_hidden is not None:
+                if sample_ref_hidden.dtype != ref_hidden_template.dtype:
+                    raise ValueError(
+                        f"packed ref_hidden_states dtype mismatch: {sample_ref_hidden.dtype} != {ref_hidden_template.dtype}"
+                    )
+                if sample_ref_hidden.shape[1:] != ref_hidden_template.shape[1:]:
+                    raise ValueError(
+                        "packed ref_hidden_states shape mismatch: "
+                        f"{sample_ref_hidden.shape[1:]} != {ref_hidden_template.shape[1:]}"
+                    )
+                ref_hidden_data += sample_ref_hidden.data
+            else:
+                ref_hidden_data += _encoded_zero_rows(ref_hidden_template, sample_len)
         for name, fill in STREAM_FILL.items():
             stream = streams[name]
             if stream is not None:
@@ -327,6 +370,13 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
     sequence_lengths = [len(sample.input_ids) for _, sample in bin_content.samples]
     assert sum(sequence_lengths) == len(input_ids), (sequence_lengths, len(input_ids))
     first_sample = bin_content.first_sample
+    ref_hidden_states = None
+    if ref_hidden_data is not None:
+        ref_hidden_states = EncodedTensor(
+            dtype=ref_hidden_template.dtype,
+            shape=[len(input_ids), *ref_hidden_template.shape[1:]],
+            data=bytes(ref_hidden_data),
+        )
 
     return MicroBatch(
         input_ids=input_ids,
@@ -336,6 +386,7 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
         inference_logprobs=inference_logprobs,
         sequence_lengths=sequence_lengths,
         ref_logprobs=ref_logprobs,
+        ref_hidden_states=ref_hidden_states,
         temperatures=temperatures,
         lora_num_tokens=lora_num_tokens,
         routed_experts=routed_experts,
@@ -451,6 +502,9 @@ def pad_micro_batch(micro_batch: MicroBatch, pad_to_multiple_of: int) -> MicroBa
     micro_batch.temperatures.extend([1.0] * padding_size)
     if micro_batch.ref_logprobs is not None:
         micro_batch.ref_logprobs.extend([0.0] * padding_size)
+    if micro_batch.ref_hidden_states is not None:
+        micro_batch.ref_hidden_states.data += _encoded_zero_rows(micro_batch.ref_hidden_states, padding_size)
+        micro_batch.ref_hidden_states.shape[0] += padding_size
     # Padding is loss-masked, so no component trains it; fill every stream
     # with 0.0 (not the pack-boundary defaults) so a padded pure-ce batch
     # still reads as rl-empty in token export, which keys off nonzero weights.
@@ -500,6 +554,11 @@ def _assert_token_arrays_aligned(micro_batch: MicroBatch) -> None:
     if micro_batch.routed_experts is not None:
         assert micro_batch.routed_experts.shape[0] == num_tokens, (
             f"routed_experts misaligned after packing: {micro_batch.routed_experts.shape[0]} != {num_tokens} tokens"
+        )
+    if micro_batch.ref_hidden_states is not None:
+        assert micro_batch.ref_hidden_states.shape[0] == num_tokens, (
+            f"ref_hidden_states misaligned after packing: "
+            f"{micro_batch.ref_hidden_states.shape[0]} != {num_tokens} tokens"
         )
 
 

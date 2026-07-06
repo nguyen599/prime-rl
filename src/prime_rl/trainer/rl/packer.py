@@ -177,6 +177,12 @@ class MultiPacker(BasePacker):
                 False,
                 f"Run wrote a sample with ref logprobs length != sample length ({len(sample.ref_logprobs)} != {sample_length})",
             )
+        if sample.ref_hidden_states is not None and sample.ref_hidden_states.shape[0] != sample_length:
+            return (
+                False,
+                "Run wrote a sample with ref hidden states length != sample length "
+                f"({sample.ref_hidden_states.shape[0]} != {sample_length})",
+            )
         return True, None
 
     def _get_batch(self) -> None:

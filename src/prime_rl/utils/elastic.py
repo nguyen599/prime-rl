@@ -245,6 +245,9 @@ class ElasticInferencePool:
     async def score(self, token_ids: list[int]) -> list[float]:
         return await self._scorer.score(self.train_clients, self.model_name, token_ids)
 
+    async def score_hidden_states(self, token_ids: list[int], dtype: str = "float16"):
+        return await self._scorer.score_hidden_states(self.train_clients, self.model_name, token_ids, dtype=dtype)
+
     @property
     def admin_clients(self) -> list[AsyncClient]:
         return list(self._admin_clients.values())

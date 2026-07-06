@@ -153,6 +153,23 @@ async def init_broadcaster(request: Request):
     return {"status": "ok"}
 
 
+@router.post("/prime_rl/prefill_hidden_states")
+async def prefill_hidden_states(request: Request):
+    data = await request.json()
+    token_ids = data.get("token_ids")
+    if not isinstance(token_ids, list):
+        return JSONResponse({"error": "token_ids must be a list"}, status_code=400)
+    dtype = data.get("dtype", "float16")
+    results = await engine_client(request).collective_rpc("prefill_hidden_states", args=(token_ids, dtype))
+    if isinstance(results, list):
+        result = next((item for item in results if item is not None), None)
+    else:
+        result = results
+    if result is None:
+        return JSONResponse({"error": "hidden-state scorer returned no result"}, status_code=500)
+    return result
+
+
 async def custom_init_app_state(
     engine_client: EngineClient,
     state: State,

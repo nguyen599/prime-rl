@@ -1,8 +1,10 @@
 import prime_rl._compat  # noqa: F401 — patch ring_flash_attn compat before import
 
 from contextlib import nullcontext
+import json
 import time
 from datetime import timedelta
+from pathlib import Path
 
 # Import environment before any other imports
 # ruff: noqa: I001
@@ -68,6 +70,72 @@ from prime_rl.utils.process import set_proc_title
 from prime_rl.utils.utils import clean_exit, resolve_latest_ckpt_step, to_col_format
 from ring_flash_attn import substitute_hf_flash_attn
 from torchtitan.distributed.utils import clip_grad_norm_
+
+
+_TEACHER_LM_HEAD_KEYS = (
+    "lm_head.weight",
+    "head.weight",
+    "model.embed_tokens.weight",
+    "model.embedding.weight",
+    "transformer.wte.weight",
+)
+
+
+def _model_vocab_size(model) -> int:
+    config = model.config
+    text_config = getattr(config, "text_config", None)
+    vocab_size = getattr(config, "vocab_size", None) or getattr(text_config, "vocab_size", None)
+    if vocab_size is None:
+        raise ValueError(f"could not infer vocab size from model config: {config}")
+    return int(vocab_size)
+
+
+def _candidate_safetensor_files(path: Path, key: str | None) -> list[Path]:
+    if path.is_file():
+        return [path]
+    if key is not None:
+        for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+            index_path = path / index_name
+            if not index_path.exists():
+                continue
+            try:
+                weight_map = json.loads(index_path.read_text()).get("weight_map", {})
+            except Exception:
+                continue
+            filename = weight_map.get(key)
+            if filename:
+                return [path / filename]
+    return sorted(path.glob("*.safetensors"))
+
+
+def _load_teacher_lm_head_weight(path: Path, key: str | None, expected_vocab_size: int) -> torch.Tensor:
+    if not path.exists():
+        raise FileNotFoundError(f"teacher_lm_head_path does not exist: {path}")
+    from safetensors import safe_open
+
+    keys = (key,) if key else _TEACHER_LM_HEAD_KEYS
+    for candidate_key in keys:
+        if not candidate_key:
+            continue
+        for tensor_path in _candidate_safetensor_files(path, candidate_key):
+            if not tensor_path.exists() or tensor_path.suffix != ".safetensors":
+                continue
+            with safe_open(tensor_path, framework="pt", device="cpu") as handle:
+                if candidate_key not in handle.keys():
+                    continue
+                tensor = handle.get_tensor(candidate_key)
+            if tensor.dim() != 2:
+                raise ValueError(
+                    f"teacher LM-head key {candidate_key!r} in {tensor_path} must be rank 2, "
+                    f"got shape {tuple(tensor.shape)}"
+                )
+            if int(tensor.shape[0]) != expected_vocab_size:
+                raise ValueError(
+                    f"teacher LM-head key {candidate_key!r} in {tensor_path} has vocab dimension {tensor.shape[0]}, "
+                    f"expected {expected_vocab_size}. Full-vocab OPD requires aligned tokenizer/vocab ids."
+                )
+            return tensor.contiguous()
+    raise FileNotFoundError(f"could not find teacher LM-head tensor in {path}; tried keys={list(keys)}")
 
 
 @clean_exit
@@ -148,6 +216,23 @@ def train(config: TrainerConfig):
     logger.info(f"Initializing model ({config.model})")
     loading_from_ckpt_later = config.ckpt and checkpoint_step is not None
     model = setup_model(config.model, parallel_dims, loading_from_ckpt_later)
+    full_vocab_teacher_lm_head_weight = None
+    if config.full_vocab_distill.enabled:
+        if parallel_dims.cp_enabled:
+            raise NotImplementedError("full-vocab OPD distillation currently requires trainer context parallel size 1")
+        if not isinstance(config.model.fused_lm_head_token_chunk_size, int):
+            raise ValueError("full-vocab OPD distillation requires fused_lm_head_token_chunk_size to be an integer")
+        teacher_head_path = config.full_vocab_distill.teacher_lm_head_path or Path(config.model.name)
+        expected_vocab_size = _model_vocab_size(model)
+        logger.info(
+            "Loading full-vocab OPD teacher LM head from "
+            f"{teacher_head_path} expected_vocab_size={expected_vocab_size}"
+        )
+        full_vocab_teacher_lm_head_weight = _load_teacher_lm_head_weight(
+            Path(teacher_head_path),
+            config.full_vocab_distill.teacher_lm_head_key,
+            expected_vocab_size,
+        ).to(device=torch.device("cuda", world.local_rank), dtype=next(model.parameters()).dtype)
 
     logger.info(f"Initializing tokenizer ({config.tokenizer})")
     tokenizer = setup_tokenizer(config.tokenizer)
@@ -326,6 +411,9 @@ def train(config: TrainerConfig):
             loss_mask = micro_batch["loss_mask"].to("cuda")
             inference_logprobs = micro_batch["inference_logprobs"].to("cuda")
             ref_logprobs = micro_batch["ref_logprobs"].to("cuda") if micro_batch["ref_logprobs"] is not None else None
+            ref_hidden_states = (
+                micro_batch["ref_hidden_states"].to("cuda") if micro_batch["ref_hidden_states"] is not None else None
+            )
             rl_weights = micro_batch["rl_weights"].to("cuda") if micro_batch["rl_weights"] is not None else None
             ce_weights = micro_batch["ce_weights"].to("cuda") if micro_batch["ce_weights"] is not None else None
             ref_kl_weights = (
@@ -390,6 +478,24 @@ def train(config: TrainerConfig):
             if cp_enabled:
                 temperatures = shard_for_cp(temperatures, cp_rank=cp_rank, cp_world_size=cp_size)
 
+            full_vocab_ref_kl_mask = None
+            full_vocab_ref_kl_weights = None
+            if config.full_vocab_distill.enabled:
+                if ref_hidden_states is None:
+                    raise ValueError("full-vocab OPD distillation requires ref_hidden_states in each microbatch")
+                if ref_hidden_states.shape[:2] != input_ids.shape[:2]:
+                    raise ValueError(
+                        f"ref_hidden_states shape {tuple(ref_hidden_states.shape)} does not align with input_ids "
+                        f"{tuple(input_ids.shape)}"
+                    )
+                if full_vocab_teacher_lm_head_weight is None:
+                    raise RuntimeError("full-vocab OPD teacher LM-head weight was not loaded")
+                token_ref_kl_weights = ref_kl_weights
+                if token_ref_kl_weights is None:
+                    token_ref_kl_weights = loss_mask.to(torch.float32)
+                full_vocab_ref_kl_mask = shift_tensor_left(token_ref_kl_weights != 0)
+                full_vocab_ref_kl_weights = shift_tensor_left(token_ref_kl_weights)
+
             # Forward pass with per-token temperatures
             with maybe_record_function("forward"), maybe_activation_offloading(config.model.ac_offloading):
                 out = forward(
@@ -401,6 +507,12 @@ def train(config: TrainerConfig):
                     mm_kwargs=mm_kwargs,
                     mm_token_type_ids=mm_token_type_ids,
                     routed_experts=routed_experts,
+                    teacher_hidden_states=ref_hidden_states if config.full_vocab_distill.enabled else None,
+                    teacher_lm_head_weight=full_vocab_teacher_lm_head_weight,
+                    full_vocab_ref_kl_mask=full_vocab_ref_kl_mask,
+                    full_vocab_ref_kl_weights=full_vocab_ref_kl_weights,
+                    full_vocab_token_chunk_size=config.full_vocab_distill.token_chunk_size,
+                    full_vocab_vocab_chunk_size=config.full_vocab_distill.vocab_chunk_size,
                 )
 
             if out.get("logprobs") is None:
@@ -431,17 +543,27 @@ def train(config: TrainerConfig):
             loss, loss_tensors = compute_loss(
                 trainer_logprobs=out["logprobs"].squeeze().split(sequence_lengths),
                 inference_logprobs=inference_logprobs.squeeze().split(sequence_lengths),
-                ref_logprobs=ref_logprobs.squeeze().split(sequence_lengths) if ref_logprobs is not None else None,
+                ref_logprobs=ref_logprobs.squeeze().split(sequence_lengths)
+                if ref_logprobs is not None and not config.full_vocab_distill.enabled
+                else None,
                 advantages=advantages.squeeze().split(sequence_lengths),
                 loss_mask=loss_mask.squeeze().split(sequence_lengths),
                 rl_weights=rl_weights.squeeze().split(sequence_lengths) if rl_weights is not None else None,
                 ce_weights=ce_weights.squeeze().split(sequence_lengths) if ce_weights is not None else None,
-                ref_kl_weights=ref_kl_weights.squeeze().split(sequence_lengths) if ref_kl_weights is not None else None,
+                ref_kl_weights=ref_kl_weights.squeeze().split(sequence_lengths)
+                if ref_kl_weights is not None and not config.full_vocab_distill.enabled
+                else None,
                 rl_loss_fn=rl_loss_fn,
                 rl_scale=rl_scale,
                 ce_scale=ce_scale,
                 ref_kl_scale=ref_kl_scale,
             )
+            if config.full_vocab_distill.enabled:
+                full_vocab_ref_kl_loss = out.get("full_vocab_ref_kl_loss")
+                if full_vocab_ref_kl_loss is None:
+                    raise RuntimeError("full-vocab OPD distillation did not produce full_vocab_ref_kl_loss")
+                loss = loss + full_vocab_ref_kl_loss / ref_kl_scale
+                loss_tensors["ref_kl/full_vocab_ref_kl"] = out["full_vocab_ref_kl"].detach()
 
             # Backward pass
             with maybe_record_function("backward"):

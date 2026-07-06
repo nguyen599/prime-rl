@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING
 from torch.nn import Module
 from vllm.model_executor.model_loader import DefaultModelLoader, get_model_loader
 
+from prime_rl.inference.vllm.worker.hidden_states import HiddenStateScoringMixin
 from prime_rl.inference.vllm.worker.weight_transfer import load_weights_checkpoint_layerwise
 
 # This is to get type hints for the Worker class but not actually extend it at runtime as this is required by vLLM worker extension
@@ -14,7 +15,7 @@ else:
     Worker = object
 
 
-class FileSystemWeightUpdateWorker(Worker):
+class FileSystemWeightUpdateWorker(HiddenStateScoringMixin, Worker):
     """vLLM worker extension for updating weights in-place using shared filesystem."""
 
     def init_broadcaster(self) -> None:

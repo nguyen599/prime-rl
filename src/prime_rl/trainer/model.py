@@ -1300,6 +1300,12 @@ def forward(
     labels: Int[Tensor, "batch seq"] | None = None,
     temperature: Tensor | None = None,
     routed_experts: Int[Tensor, "batch seq layers topk"] | None = None,
+    teacher_hidden_states: Tensor | None = None,
+    teacher_lm_head_weight: Tensor | None = None,
+    full_vocab_ref_kl_mask: Tensor | None = None,
+    full_vocab_ref_kl_weights: Tensor | None = None,
+    full_vocab_token_chunk_size: int = 64,
+    full_vocab_vocab_chunk_size: int = 8192,
     # Generic multimodal kwargs (e.g. {"pixel_values": ...,
     # "image_grid_thw": ...} for Qwen3-VL; just {"pixel_values": ...}
     # for Gemma3). Passed straight through to ``model(**kwargs)`` so
@@ -1334,6 +1340,18 @@ def forward(
 
     if routed_experts is not None:
         kwargs["routed_experts"] = routed_experts
+
+    if teacher_hidden_states is not None:
+        kwargs.update(
+            {
+                "teacher_hidden_states": teacher_hidden_states,
+                "teacher_lm_head_weight": teacher_lm_head_weight,
+                "full_vocab_ref_kl_mask": full_vocab_ref_kl_mask,
+                "full_vocab_ref_kl_weights": full_vocab_ref_kl_weights,
+                "full_vocab_token_chunk_size": full_vocab_token_chunk_size,
+                "full_vocab_vocab_chunk_size": full_vocab_vocab_chunk_size,
+            }
+        )
 
     out = model(**kwargs)
 

@@ -27,6 +27,7 @@ class TensorMicroBatch(TypedDict):
     advantages: Float[Tensor, "batch seq"]
     inference_logprobs: Float[Tensor, "batch seq"]
     ref_logprobs: Float[Tensor, "batch seq"] | None
+    ref_hidden_states: Float[Tensor, "batch seq hidden"] | None
     loss_mask: Bool[Tensor, "batch seq"]
     temperatures: Float[Tensor, "batch seq"]  # Per-token temperatures
     env_names: list[str]
@@ -124,6 +125,7 @@ class FakeDataLoader:
             "advantages": advantages.unsqueeze(0),
             "inference_logprobs": inference_logprobs.unsqueeze(0),
             "ref_logprobs": None,
+            "ref_hidden_states": None,
             "temperatures": torch.ones(input_ids.shape[0]).unsqueeze(0),
             "env_names": ["fake"] * input_ids.shape[0],
             "sequence_lengths": sequence_lengths,
@@ -156,6 +158,7 @@ class FakeDataLoader:
             "advantages": torch.randn(self.seq_len, generator=generator).unsqueeze(0),
             "inference_logprobs": torch.randn(self.seq_len, generator=generator).unsqueeze(0),
             "ref_logprobs": None,
+            "ref_hidden_states": None,
             "temperatures": torch.ones(self.seq_len).unsqueeze(0),
             "env_names": ["fake"] * self.seq_len,
             "sequence_lengths": [self.seq_len],
@@ -222,6 +225,16 @@ class DataLoader:
         if micro_batch.lora_num_tokens is None:
             micro_batch.lora_num_tokens = [0] * self.multi_run_manager.max_runs
             micro_batch.lora_num_tokens[0] = len(micro_batch.input_ids)
+        ref_hidden_states = None
+        if micro_batch.ref_hidden_states is not None:
+            ref_hidden_states = (
+                torch.frombuffer(
+                    bytearray(micro_batch.ref_hidden_states.data),
+                    dtype=_torch_dtype(micro_batch.ref_hidden_states.dtype),
+                )
+                .reshape(micro_batch.ref_hidden_states.shape)
+                .unsqueeze(0)
+            )
         mm_kwargs: dict[str, Tensor] | None = None
         if micro_batch.mm_kwargs:
             # Each value is an EncodedTensor (dtype, shape, raw bytes).
@@ -251,6 +264,7 @@ class DataLoader:
             ref_logprobs=torch.tensor(micro_batch.ref_logprobs, dtype=torch.float).unsqueeze(0)
             if micro_batch.ref_logprobs is not None
             else None,
+            ref_hidden_states=ref_hidden_states,
             loss_mask=torch.tensor(micro_batch.loss_mask, dtype=torch.bool).unsqueeze(0),
             temperatures=torch.tensor(micro_batch.temperatures, dtype=torch.float).unsqueeze(0),
             env_names=micro_batch.env_names,

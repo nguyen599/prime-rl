@@ -7,6 +7,7 @@ from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.utils import StatelessProcessGroup
 from vllm.logger import init_logger
 
+from prime_rl.inference.vllm.worker.hidden_states import HiddenStateScoringMixin
 from prime_rl.inference.vllm.worker.weight_transfer import (
     load_weights_checkpoint_layerwise,
     load_weights_kernel,
@@ -89,7 +90,7 @@ class NCCLWeightBroadcastReceiver:
                 yield key, value
 
 
-class NCCLWeightUpdateWorker(Worker):
+class NCCLWeightUpdateWorker(HiddenStateScoringMixin, Worker):
     """vLLM worker extension for updating weights in-place using NCCL."""
 
     def init_broadcaster(

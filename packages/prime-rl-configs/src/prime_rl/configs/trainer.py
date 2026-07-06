@@ -545,6 +545,32 @@ WeightBroadcastConfig: TypeAlias = Annotated[
 ]
 
 
+class FullVocabDistillConfig(BaseConfig):
+    enabled: bool = False
+    """Enable full-vocabulary OPD distillation from teacher hidden states.
+
+    Disabled by default so legacy OPD continues to use scalar teacher
+    ``ref_logprobs``.
+    """
+
+    teacher_lm_head_path: Path | None = None
+    """HF checkpoint directory used to load the teacher LM head. Defaults to
+    ``trainer.model.name`` when unset."""
+
+    teacher_lm_head_key: str | None = None
+    """Optional exact tensor key for the teacher LM head. When unset, common
+    tied and untied LM-head keys are tried."""
+
+    token_chunk_size: int = Field(64, ge=1)
+    """Number of selected tokens per full-vocab KL chunk."""
+
+    vocab_chunk_size: int = Field(8192, ge=1)
+    """Vocabulary chunk size used by the full-vocab KL computation."""
+
+    teacher_hidden_dtype: Literal["float16", "bfloat16", "float32"] = "float16"
+    """dtype requested from the teacher hidden-state scorer."""
+
+
 class TrainerConfig(BaseConfig):
     model: ModelConfig = ModelConfig()
 
@@ -564,6 +590,9 @@ class TrainerConfig(BaseConfig):
 
     weight_broadcast: WeightBroadcastConfig = FileSystemWeightBroadcastConfig()
     """Transport used to broadcast updated weights from trainer to inference."""
+
+    full_vocab_distill: FullVocabDistillConfig = FullVocabDistillConfig()
+    """Optional full-vocabulary distillation for OPD. Default is disabled."""
 
     rollout_transport: TransportConfig = FileSystemTransportConfig()
     """Transport used to ship rollouts from orchestrator to trainer."""

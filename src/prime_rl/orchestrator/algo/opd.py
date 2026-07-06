@@ -42,6 +42,11 @@ class OPDAlgorithm(Algorithm):
         assert pool is not None, "teacher pool not connected — Algorithm.setup() must run first"
 
         async def score_sample(sample: TrainingSample) -> None:
-            sample.ref_logprobs = await pool.score(list(sample.token_ids))
+            token_ids = list(sample.token_ids)
+            if self.config.distill_mode == "full_vocab_hidden":
+                sample.ref_hidden_states = await pool.score_hidden_states(token_ids, dtype=self.config.teacher_hidden_dtype)
+                sample.ref_logprobs = None
+            else:
+                sample.ref_logprobs = await pool.score(token_ids)
 
         await asyncio.gather(*(score_sample(sample) for sample in rollout.samples))

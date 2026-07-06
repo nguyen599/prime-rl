@@ -105,6 +105,10 @@ CUDA_VISIBLE_DEVICES=1 uv run inference \
 
 The standalone `uv run sft` entrypoint is the more traditional SFT path — pure dataset-based, no orchestrator. Use the `sft` algorithm only when you want a frozen model to generate the supervision on the fly.
 
+`opd` uses sampled-token `prompt_logprobs` by default. For the opt-in variant
+that sends teacher hidden states and computes full-vocabulary reverse KL in the
+trainer, see [Full-Vocab OPD](full-vocab-opd.md).
+
 ### Important Metrics
 
 Pulled from the console logs and mirrored to W&B.

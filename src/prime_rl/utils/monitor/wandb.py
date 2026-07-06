@@ -142,7 +142,7 @@ def _is_proof_opd_rollout(rollout) -> bool:
 
     answer = _task_answer_payload(rollout)
     task_type = str(answer.get("task_type") or "").lower()
-    return task_type in {"proof", "verifiable"} and ("problem" in answer or "gold_answer" in answer)
+    return task_type in {"proof", "verifiable"} and "problem" in answer
 
 
 def _classify_proof_opd_stage(prompt: str) -> str:
@@ -180,7 +180,7 @@ def _fallback_proof_opd_trace(rollout, branch=None) -> dict[str, Any]:
     metrics = getattr(rollout, "metrics", {}) or {}
     task_type = str(answer.get("task_type") or "").strip()
     if not task_type:
-        task_type = "verifiable" if float(metrics.get("proof_opd_task_is_verifiable", 0.0) or 0.0) > 0.5 else "proof"
+        task_type = "proof"
 
     stage_records: list[dict[str, Any]] = []
     current_round = 0
@@ -224,20 +224,11 @@ def _fallback_proof_opd_trace(rollout, branch=None) -> dict[str, Any]:
     if not stage_records:
         return {}
 
-    gold_answer = str(answer.get("gold_answer") or task_record.get("gold_answer") or "")
-    verifiable_accuracy = metrics.get("proof_opd_verifiable_accuracy", -1.0)
-    answer_match_method_id = metrics.get("proof_opd_answer_match_method", -1.0)
     return {
         "task_id": task_record.get("task_id") or answer.get("task_id"),
         "source_index": task_record.get("source_index"),
         "task_type": task_type,
         "problem": answer.get("problem") or task_record.get("problem") or task_record.get("prompt", ""),
-        "gold_answer": gold_answer,
-        "boxed_answer": "",
-        "boxed_present": metrics.get("proof_opd_boxed_present", 0.0),
-        "verifiable_accuracy": verifiable_accuracy,
-        "answer_match_method": "unknown_fallback" if task_type == "verifiable" else "not_verifiable",
-        "answer_match_method_id": answer_match_method_id,
         "reward": getattr(rollout, "reward", 0.0),
         "format_score": metrics.get("proof_opd_format_score"),
         "proof_score": metrics.get("proof_opd_proof_score"),
@@ -403,10 +394,6 @@ class WandbMonitor(Monitor):
                     "input_ids",
                     "reward",
                     "task_type",
-                    "gold_answer",
-                    "boxed_answer",
-                    "verifiable_accuracy",
-                    "answer_match_method",
                     "proof_opd_trace",
                 ]
                 self.samples_table = wandb.Table(
@@ -489,10 +476,6 @@ class WandbMonitor(Monitor):
                     "input_ids": str(token_ids),
                     "reward": trace.reward,
                     "task_type": proof_trace.get("task_type", ""),
-                    "gold_answer": proof_trace.get("gold_answer", ""),
-                    "boxed_answer": proof_trace.get("boxed_answer", ""),
-                    "verifiable_accuracy": proof_trace.get("verifiable_accuracy", ""),
-                    "answer_match_method": proof_trace.get("answer_match_method", ""),
                     "proof_opd_trace": _json_table_cell(proof_trace) if proof_trace else "",
                 }
                 assert list(sample.keys()) == self.samples_cols, (

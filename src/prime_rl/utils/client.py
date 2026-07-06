@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 from collections.abc import Mapping
 from itertools import cycle
@@ -16,6 +17,7 @@ from tenacity import AsyncRetrying, retry, retry_if_exception, stop_after_attemp
 from verifiers.v1.clients.config import EvalClientConfig, TrainClientConfig
 
 from prime_rl.configs.shared import ClientConfig
+from prime_rl.transport.types import EncodedTensor
 from prime_rl.utils.logger import get_logger
 
 # Identity tuple used by ``select_train_client`` to key load counts. ``base_url``
@@ -77,6 +79,10 @@ class InferencePool(Protocol):
         """Prefill-score ``token_ids`` under the pool's model — one logprob per token."""
         ...
 
+    async def score_hidden_states(self, token_ids: list[int], dtype: str = "float16") -> EncodedTensor:
+        """Prefill-score ``token_ids`` as teacher hidden states for full-vocab OPD."""
+        ...
+
     async def stop(self) -> None:
         """Stop the inference pool."""
         ...
@@ -94,6 +100,16 @@ class PrefillScorer:
         self._rr = 0
 
     async def score(self, configs: list[vf.ClientConfig], model: str, token_ids: list[int]) -> list[float]:
+        openai = self._get_openai(configs)
+        return await prefill_logprobs(openai, model, token_ids)
+
+    async def score_hidden_states(
+        self, configs: list[vf.ClientConfig], model: str, token_ids: list[int], dtype: str = "float16"
+    ) -> EncodedTensor:
+        openai = self._get_openai(configs)
+        return await prefill_hidden_states(openai, model, token_ids, dtype=dtype)
+
+    def _get_openai(self, configs: list[vf.ClientConfig]) -> AsyncOpenAI:
         if not configs:
             raise RuntimeError("no inference endpoints available to prefill-score")
         cfg = configs[self._rr % len(configs)]
@@ -109,7 +125,7 @@ class PrefillScorer:
                 api_key=os.environ.get(cfg.api_key_var) or "EMPTY",
                 default_headers=cfg.headers or None,
             )
-        return await prefill_logprobs(openai, model, token_ids)
+        return openai
 
     async def aclose(self) -> None:
         await asyncio.gather(*(c.close() for c in self._clients.values()))
@@ -179,6 +195,9 @@ class StaticInferencePool:
         """Prefill-score ``token_ids`` under this pool's model (one logprob per
         token, 0.0 for the leading token). Delegates to the shared scorer."""
         return await self._scorer.score(self.train_clients, self.model_name, token_ids)
+
+    async def score_hidden_states(self, token_ids: list[int], dtype: str = "float16") -> EncodedTensor:
+        return await self._scorer.score_hidden_states(self.train_clients, self.model_name, token_ids, dtype=dtype)
 
     async def stop(self) -> None:
         await self._scorer.aclose()
@@ -605,3 +624,27 @@ async def prefill_logprobs(openai: AsyncOpenAI, model: str, token_ids: list[int]
         lp = first.logprob if hasattr(first, "logprob") else first.get("logprob")
         flat.append(float(lp) if lp is not None else 0.0)
     return flat
+
+
+async def prefill_hidden_states(
+    openai: AsyncOpenAI, model: str, token_ids: list[int], dtype: str = "float16"
+) -> EncodedTensor:
+    """Request teacher last hidden states from the Prime-RL vLLM worker extension.
+
+    The returned rows are aligned with ``token_ids`` and are consumed only by
+    the opt-in full-vocab OPD trainer path.
+    """
+    base = str(openai.base_url).rstrip("/").removesuffix("/v1")
+    http_response = await openai.post(
+        f"{base}/prime_rl/prefill_hidden_states",
+        cast_to=httpx.Response,
+        body={"model": model, "token_ids": token_ids, "dtype": dtype},
+    )
+    payload = http_response.json()
+    try:
+        raw = base64.b64decode(payload["data"])
+        shape = [int(x) for x in payload["shape"]]
+        tensor_dtype = str(payload["dtype"])
+    except Exception as exc:
+        raise RuntimeError(f"invalid hidden-state scorer response: {payload!r}") from exc
+    return EncodedTensor(dtype=tensor_dtype, shape=shape, data=raw)
