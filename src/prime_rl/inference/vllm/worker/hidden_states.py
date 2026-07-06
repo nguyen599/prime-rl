@@ -8,17 +8,13 @@ from torch.nn import Module
 class HiddenStateScoringMixin:
     """Worker RPC for full-vocab OPD teacher hidden-state scoring.
 
-    The first implementation intentionally supports TP=1 only. With TP>1 the
-    hidden states may be partitioned differently by vLLM internals, and a wrong
-    reconstruction would silently corrupt the full-vocab KL signal.
+    vLLM tensor-parallel layers all-reduce row-parallel outputs, so the final
+    hidden states returned by the model runner are expected to be replicated on
+    each TP rank. The API server picks the first non-null worker response.
     """
 
     @torch.no_grad()
     def prefill_hidden_states(self, token_ids: list[int], dtype: str = "float16") -> dict[str, Any]:
-        tp_size = getattr(getattr(self.vllm_config, "parallel_config", None), "tensor_parallel_size", 1)
-        if tp_size != 1:
-            raise NotImplementedError("full-vocab OPD teacher hidden-state scoring currently supports TP=1 only")
-
         model_runner = self.model_runner
         if hasattr(model_runner.model, "runnable"):
             model = model_runner.model.runnable
