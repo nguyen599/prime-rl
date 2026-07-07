@@ -36,6 +36,7 @@ Three changes
 from __future__ import annotations
 
 from collections.abc import Callable
+from copy import copy
 
 import torch
 import torch.nn as nn
@@ -114,18 +115,34 @@ class Olmo3SinkRotaryEmbedding(Olmo3RotaryEmbedding):
     rope type from the config, so it cannot express the default-RoPE sliding
     layers)."""
 
-    def __init__(self, config: Olmo3SinkConfig, device=None, rope_type: str | None = None):
+    def __init__(
+        self,
+        config: Olmo3SinkConfig,
+        device=None,
+        rope_type: str | None = None,
+        layer_type: str | None = None,
+    ):
         nn.Module.__init__(self)
         self.max_seq_len_cached = config.max_position_embeddings
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
+        self.layer_type = layer_type
 
         self.rope_type = rope_type or self.config.rope_parameters["rope_type"]
         rope_init_fn: Callable = self.compute_default_rope_parameters
         if self.rope_type != "default":
             rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
-        inv_freq, self.attention_scaling = rope_init_fn(self.config, device)
+        try:
+            inv_freq, self.attention_scaling = rope_init_fn(self.config, device, layer_type=layer_type)
+        except TypeError as exc:
+            if "layer_type" not in str(exc) and "unexpected keyword" not in str(exc):
+                raise
+            layer_config = self.config
+            if layer_type is not None:
+                layer_config = copy(self.config)
+                layer_config.rope_parameters = self.config.rope_parameters[layer_type]
+            inv_freq, self.attention_scaling = rope_init_fn(layer_config, device)
 
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
@@ -274,8 +291,12 @@ class Olmo3SinkModel(Olmo3SinkPreTrainedModel, Olmo3Model):
         # configured (e.g. YaRN) RoPE. Replaces the buggy global `rotary_emb`.
         self.rotary_embs = nn.ModuleDict(
             {
-                "sliding_attention": Olmo3SinkRotaryEmbedding(config=config, rope_type="default"),
-                "full_attention": Olmo3SinkRotaryEmbedding(config=config),
+                "sliding_attention": Olmo3SinkRotaryEmbedding(
+                    config=config,
+                    rope_type="default",
+                    layer_type="sliding_attention",
+                ),
+                "full_attention": Olmo3SinkRotaryEmbedding(config=config, layer_type="full_attention"),
             }
         )
         del self.rotary_emb
