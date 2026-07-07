@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any
 import httpx
 import pyarrow as pa
 import pyarrow.parquet as pq
-from prime_cli.core.config import Config as PrimeConfig
 from transformers.tokenization_utils import PreTrainedTokenizer
 
 from prime_rl.configs.orchestrator import OrchestratorConfig
@@ -52,6 +51,14 @@ _SAMPLE_SCHEMA = pa.schema(
 
 
 _DROPPED_JSON_VALUE = object()
+
+
+def _load_prime_config() -> Any | None:
+    try:
+        from prime_cli.core.config import Config as PrimeConfig
+    except ImportError:
+        return None
+    return PrimeConfig()
 
 
 def _drop_non_finite_json_values(value: Any, dropped_paths: list[str], path: str = "") -> Any:
@@ -132,8 +139,8 @@ class PrimeMonitor(Monitor):
 
         api_key = os.getenv(config.api_key_var)
         if api_key is None:
-            prime_config = PrimeConfig()
-            api_key = prime_config.api_key
+            prime_config = _load_prime_config()
+            api_key = prime_config.api_key if prime_config is not None else None
 
         if not api_key:
             self.logger.warning(
@@ -186,10 +193,10 @@ class PrimeMonitor(Monitor):
         team_id = config.team_id
         frontend_url = config.frontend_url
         if team_id is None or frontend_url is None:
-            prime_config = PrimeConfig()
-        if team_id is None:
+            prime_config = _load_prime_config()
+        if team_id is None and prime_config is not None:
             team_id = prime_config.team_id
-        if frontend_url is None:
+        if frontend_url is None and prime_config is not None:
             frontend_url = prime_config.frontend_url
 
         payload: dict[str, Any] = {
