@@ -111,7 +111,10 @@ This endpoint is only used by `distill_mode = "full_vocab_hidden"`.
 
 Full-vocab OPD currently has conservative guards:
 
-- Teacher hidden-state scoring supports teacher TP=1 only.
+- Teacher hidden-state scoring supports vLLM tensor parallelism when the
+  teacher model runner returns replicated final hidden states after TP
+  collectives. The API server queries all workers and uses the first non-null
+  response.
 - Trainer context parallelism must be CP=1.
 - Trainer must use an integer `model.fused_lm_head_token_chunk_size`.
 - The teacher LM-head tensor must be available as HF safetensors.
@@ -120,9 +123,11 @@ Full-vocab OPD currently has conservative guards:
 - Hidden states are transmitted as float16, bfloat16, or float32 raw tensor
   bytes. There is no int6 hidden-state compression yet.
 
-These limits are intentional. They prevent silent wrong KL when teacher hidden
+These limits are intentional. They prevent silent wrong KL when trainer hidden
 states or LM-head weights are sharded in a layout the trainer does not yet
-reconstruct.
+reconstruct. If a new vLLM backend returns sharded final hidden states instead
+of replicated hidden states, add an explicit gather before using it for
+full-vocab OPD.
 
 ## Performance Knobs
 
@@ -138,10 +143,10 @@ padding, CE-only, and masked tokens are skipped.
 
 ## Troubleshooting
 
-`full-vocab OPD distillation currently supports TP=1 only`
-: The teacher vLLM server was started with tensor parallelism greater than 1.
-  Use the default scalar OPD mode, or run the teacher with TP=1 until sharded
-  hidden-state reconstruction is implemented.
+`hidden-state scorer returned no result`
+: The teacher endpoint did not return a worker hidden-state tensor. Check that
+  the vLLM worker patch is loaded and that `/prime_rl/prefill_hidden_states`
+  is registered on the teacher server.
 
 `full-vocab OPD distillation currently requires trainer context parallel size 1`
 : CP sharding is not supported for this path yet. Set trainer CP to 1.
