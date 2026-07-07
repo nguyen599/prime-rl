@@ -45,21 +45,39 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 
 
-def _base_rope_parameters(config) -> dict:
-    rope_parameters = getattr(config, "rope_parameters", None)
-    if rope_parameters:
-        rope_parameters = dict(rope_parameters)
-    else:
-        rope_parameters = dict(getattr(config, "rope_scaling", None) or {})
-        if "type" in rope_parameters and "rope_type" not in rope_parameters:
-            rope_parameters["rope_type"] = rope_parameters.pop("type")
-    rope_parameters.setdefault("rope_theta", getattr(config, "rope_theta", 500000))
-    return rope_parameters
+def _normalize_rope_parameters(config, rope_parameters: dict) -> dict:
+    normalized = {}
+    for key, value in rope_parameters.items():
+        # Some OLMo3 configs store per-layer-type RoPE settings under nested
+        # dictionaries. vLLM caches RoPE modules by hashing this dict's values,
+        # so any still-nested dict would crash in get_rope().
+        if isinstance(value, dict):
+            continue
+        normalized[key] = value
+    if "type" in normalized and "rope_type" not in normalized:
+        normalized["rope_type"] = normalized.pop("type")
+    if "attention_factor" in normalized and "attn_factor" not in normalized:
+        normalized["attn_factor"] = normalized.pop("attention_factor")
+    normalized.setdefault("rope_theta", getattr(config, "rope_theta", 500000))
+    return normalized
+
+
+def _base_rope_parameters(config, sliding_window: int | None) -> dict:
+    raw_parameters = getattr(config, "rope_parameters", None)
+    if not raw_parameters:
+        raw_parameters = getattr(config, "rope_scaling", None) or {}
+    raw_parameters = dict(raw_parameters)
+
+    layer_type = "sliding_attention" if sliding_window is not None else "full_attention"
+    if isinstance(raw_parameters.get(layer_type), dict):
+        raw_parameters = dict(raw_parameters[layer_type])
+
+    return _normalize_rope_parameters(config, raw_parameters)
 
 
 def _rope_parameters_for_layer(config, sliding_window: int | None) -> dict:
     """Match OLMo3/olmo3_sink serving: YaRN only on full-attention layers."""
-    rope_parameters = _base_rope_parameters(config)
+    rope_parameters = _base_rope_parameters(config, sliding_window)
     if sliding_window is None:
         return rope_parameters
     return {
