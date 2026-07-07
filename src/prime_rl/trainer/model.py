@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+from copy import copy
 from pathlib import Path
 from typing import cast
 
@@ -1017,7 +1018,21 @@ def _rope_init_fn_for_rotary_emb(rotary_emb: nn.Module):
 def _reinit_rotary_embedding_buffers(rotary_emb: nn.Module, *, copy_original_inv_freq: bool) -> None:
     inv_freq_buffer = rotary_emb.inv_freq
     rope_init_fn = _rope_init_fn_for_rotary_emb(rotary_emb)
-    inv_freq, attention_scaling = rope_init_fn(rotary_emb.config, inv_freq_buffer.device)
+    config = rotary_emb.config
+    layer_type = getattr(rotary_emb, "layer_type", None)
+    try:
+        if layer_type is None:
+            inv_freq, attention_scaling = rope_init_fn(config, inv_freq_buffer.device)
+        else:
+            inv_freq, attention_scaling = rope_init_fn(config, inv_freq_buffer.device, layer_type=layer_type)
+    except (KeyError, TypeError) as exc:
+        if layer_type is None or not hasattr(config, "rope_parameters") or layer_type not in config.rope_parameters:
+            raise
+        if isinstance(exc, TypeError) and "layer_type" not in str(exc) and "unexpected keyword" not in str(exc):
+            raise
+        layer_config = copy(config)
+        layer_config.rope_parameters = config.rope_parameters[layer_type]
+        inv_freq, attention_scaling = rope_init_fn(layer_config, inv_freq_buffer.device)
     rotary_emb.inv_freq.copy_(inv_freq)
     if copy_original_inv_freq and hasattr(rotary_emb, "original_inv_freq"):
         rotary_emb.original_inv_freq.copy_(inv_freq)
