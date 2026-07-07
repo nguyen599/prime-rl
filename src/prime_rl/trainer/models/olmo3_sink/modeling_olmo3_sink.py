@@ -129,7 +129,10 @@ class Olmo3SinkRotaryEmbedding(Olmo3RotaryEmbedding):
         self.config = config
         self.layer_type = layer_type
 
-        self.rope_type = rope_type or self.config.rope_parameters["rope_type"]
+        rope_parameters = self.config.rope_parameters
+        if layer_type is not None and layer_type in rope_parameters:
+            rope_parameters = rope_parameters[layer_type]
+        self.rope_type = rope_type or rope_parameters["rope_type"]
         rope_init_fn: Callable = self.compute_default_rope_parameters
         if self.rope_type != "default":
             rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
