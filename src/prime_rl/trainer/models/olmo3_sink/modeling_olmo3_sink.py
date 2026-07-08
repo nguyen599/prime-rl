@@ -159,11 +159,12 @@ def _call_rope_forward_for_layer(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Call RoPE forward across Transformers versions."""
 
-    try:
-        return rotary_emb(hidden_states, position_ids, layer_type=layer_type)
-    except TypeError as exc:
-        if "layer_type" not in str(exc) and "unexpected keyword" not in str(exc):
-            raise
+    if isinstance(getattr(rotary_emb, "rope_type", None), dict):
+        try:
+            return rotary_emb(hidden_states, position_ids, layer_type=layer_type)
+        except TypeError as exc:
+            if "layer_type" not in str(exc) and "unexpected keyword" not in str(exc):
+                raise
     return rotary_emb(hidden_states, position_ids)
 
 
