@@ -53,13 +53,16 @@ class HiddenStateScoringMixin:
             captures = getattr(worker, "_prime_hidden_state_captures", {})
             if captures:
                 runner = worker.model_runner
-                captured_any = False
+                completed_capture_req_ids: list[str] = []
                 for req_id in list(getattr(runner.input_batch, "req_ids", [])):
                     capture = captures.get(req_id)
                     if capture is None:
                         continue
                     num_tokens = num_scheduled_tokens.get(req_id) if isinstance(num_scheduled_tokens, dict) else None
-                    if not num_tokens:
+                    if num_tokens is None:
+                        continue
+                    num_tokens = int(num_tokens)
+                    if num_tokens <= 0:
                         continue
                     req_idx = runner.input_batch.req_id_to_index.get(req_id)
                     if req_idx is None:
@@ -74,18 +77,27 @@ class HiddenStateScoringMixin:
                     copy_len = min(int(num_tokens), target_len - start_pos)
                     if copy_len <= 0:
                         continue
-                    offset = int(runner.query_start_loc.np[req_idx])
+                    offset_value = runner.query_start_loc.np[req_idx]
+                    offset = int(offset_value.item() if hasattr(offset_value, "item") else offset_value)
                     target_dtype = getattr(torch, capture["dtype"])
                     chunk = hidden_states[offset : offset + copy_len].detach().to(dtype=target_dtype).cpu().contiguous()
                     capture["chunks"][start_pos] = chunk
-                    captured_any = True
+                    if start_pos + copy_len >= target_len:
+                        completed_capture_req_ids.append(req_id)
 
-                if captured_any:
-                    # This request uses prompt_logprobs only as a stable hook into
-                    # vLLM's normal prefill path. Returning an empty dict avoids
-                    # materializing real prompt-logprob tensors for 80k-token
-                    # teacher sequences, which would be wasteful and can OOM.
-                    return {}
+                # These requests use prompt_logprobs only as a stable hook into
+                # vLLM's normal prefill path. Never fall through to the real
+                # prompt-logprob path while a hidden-state capture is installed:
+                # it would materialize huge logits and, for DeepSeek V4, can call
+                # compute_logits outside the forward context required by MLA.
+                num_prompt_logprobs = getattr(runner, "num_prompt_logprobs", None)
+                if isinstance(num_prompt_logprobs, dict):
+                    for req_id in completed_capture_req_ids:
+                        num_prompt_logprobs.pop(req_id, None)
+                        request_state = runner.requests.get(req_id)
+                        if request_state is not None:
+                            request_state.in_progress_prompt_logprobs_cpu = None
+                return {}
 
             return original(hidden_states, num_scheduled_tokens, *args, **kwargs)
 
