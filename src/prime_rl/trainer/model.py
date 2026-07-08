@@ -1034,11 +1034,27 @@ def _layer_rope_config(config, layer_type: str | None):
 
 
 def _nested_rope_config(config, layer_config, layer_type: str | None):
-    raw_parameters = getattr(layer_config, "rope_parameters", None)
-    if not isinstance(raw_parameters, dict):
+    raw_config_parameters = getattr(config, "rope_parameters", None)
+    raw_layer_parameters = getattr(layer_config, "rope_parameters", None)
+    if not isinstance(raw_layer_parameters, dict):
         return config
     nested_config = copy(config)
-    nested_config.rope_parameters = {layer_type: dict(raw_parameters)}
+    if isinstance(raw_config_parameters, dict) and layer_type is not None and isinstance(
+        raw_config_parameters.get(layer_type), dict
+    ):
+        nested_config.rope_parameters = {
+            key: dict(value) if isinstance(value, dict) else value
+            for key, value in raw_config_parameters.items()
+        }
+    else:
+        layer_types = list(dict.fromkeys(getattr(config, "layer_types", []) or []))
+        if layer_type is not None and layer_type not in layer_types:
+            layer_types.append(layer_type)
+        if not layer_types:
+            layer_types = [layer_type]
+        nested_config.rope_parameters = {
+            key: dict(raw_layer_parameters) for key in layer_types if key is not None
+        }
     return nested_config
 
 

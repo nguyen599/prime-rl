@@ -122,7 +122,23 @@ def _call_rope_init_for_layer(
     """
 
     nested_config = copy(config)
-    nested_config.rope_parameters = {layer_type: dict(layer_config.rope_parameters)}
+    raw_rope_parameters = getattr(config, "rope_parameters", None)
+    if isinstance(raw_rope_parameters, dict) and layer_type is not None and isinstance(
+        raw_rope_parameters.get(layer_type), dict
+    ):
+        nested_config.rope_parameters = {
+            key: dict(value) if isinstance(value, dict) else value
+            for key, value in raw_rope_parameters.items()
+        }
+    else:
+        layer_types = list(dict.fromkeys(getattr(config, "layer_types", []) or []))
+        if layer_type is not None and layer_type not in layer_types:
+            layer_types.append(layer_type)
+        if not layer_types:
+            layer_types = [layer_type]
+        nested_config.rope_parameters = {
+            key: dict(layer_config.rope_parameters) for key in layer_types if key is not None
+        }
     try:
         return rope_init_fn(nested_config, device, layer_type=layer_type)
     except TypeError as exc:
