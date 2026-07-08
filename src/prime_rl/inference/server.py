@@ -26,9 +26,15 @@ def setup_vllm_env(config: InferenceConfig):
     # sees. Keep it off so rollout logprobs stay faithful for importance ratios.
     os.environ.setdefault("VLLM_ENFORCE_STRICT_TOOL_CALLING", "0")
 
-    deep_gemm_enabled = "1" if config.use_deep_gemm else "0"
-    os.environ["VLLM_USE_DEEP_GEMM"] = deep_gemm_enabled
-    os.environ["VLLM_MOE_USE_DEEP_GEMM"] = deep_gemm_enabled
+    if config.use_deep_gemm:
+        os.environ["VLLM_USE_DEEP_GEMM"] = "1"
+        os.environ["VLLM_MOE_USE_DEEP_GEMM"] = "1"
+    else:
+        # Leave vLLM's defaults intact. DeepSeek-V4-Flash can successfully use
+        # --linear-backend deep_gemm with the default MoE backend when these are
+        # unset, while forcing "0" changes the FP8 kernel selection path.
+        os.environ.pop("VLLM_USE_DEEP_GEMM", None)
+        os.environ.pop("VLLM_MOE_USE_DEEP_GEMM", None)
 
     if config.enable_lora:
         os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
