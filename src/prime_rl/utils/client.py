@@ -98,6 +98,8 @@ class PrefillScorer:
     def __init__(self) -> None:
         self._clients: dict = {}  # client_identity -> AsyncOpenAI, one per endpoint
         self._rr = 0
+        hidden_concurrency = int(os.environ.get("PRIME_RL_PREFILL_HIDDEN_CONCURRENCY", "1"))
+        self._hidden_semaphore = asyncio.Semaphore(max(1, hidden_concurrency))
 
     async def score(self, configs: list[vf.ClientConfig], model: str, token_ids: list[int]) -> list[float]:
         openai = self._get_openai(configs)
@@ -107,7 +109,8 @@ class PrefillScorer:
         self, configs: list[vf.ClientConfig], model: str, token_ids: list[int], dtype: str = "float16"
     ) -> EncodedTensor:
         openai = self._get_openai(configs)
-        return await prefill_hidden_states(openai, model, token_ids, dtype=dtype)
+        async with self._hidden_semaphore:
+            return await prefill_hidden_states(openai, model, token_ids, dtype=dtype)
 
     def _get_openai(self, configs: list[vf.ClientConfig]) -> AsyncOpenAI:
         if not configs:
