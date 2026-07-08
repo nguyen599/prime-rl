@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 from argparse import Namespace
 from typing import Any
 
@@ -12,7 +13,9 @@ from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_se
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.lora.protocol import LoadLoRAAdapterRequest
+from vllm.inputs import TokensPrompt
 from vllm.logger import init_logger
+from vllm.sampling_params import SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from prime_rl.configs.inference import InferenceConfig
@@ -160,7 +163,33 @@ async def prefill_hidden_states(request: Request):
     if not isinstance(token_ids, list):
         return JSONResponse({"error": "token_ids must be a list"}, status_code=400)
     dtype = data.get("dtype", "float16")
-    results = await engine_client(request).collective_rpc("prefill_hidden_states", args=(token_ids, dtype))
+
+    hidden_request_id = f"prime-hidden-{uuid.uuid4().hex}"
+    client = engine_client(request)
+
+    # Install capture before the request enters the scheduler. The request is
+    # then executed by vLLM's normal prefill path, so DeepSeek/MLA attention sees
+    # real ForwardContext and attention metadata.
+    await client.collective_rpc(
+        "prepare_hidden_state_capture",
+        args=(hidden_request_id, len(token_ids), dtype),
+    )
+
+    sampling_params = SamplingParams(
+        max_tokens=1,
+        temperature=0.0,
+        top_p=1.0,
+        detokenize=False,
+    )
+    async for _ in client.generate(
+        TokensPrompt(prompt_token_ids=token_ids),
+        sampling_params,
+        hidden_request_id,
+        priority=data.get("priority", 0),
+    ):
+        pass
+
+    results = await client.collective_rpc("pop_hidden_state_capture", args=(hidden_request_id,))
     if isinstance(results, list):
         result = next((item for item in results if item is not None), None)
     else:
