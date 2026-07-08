@@ -53,6 +53,7 @@ class HiddenStateScoringMixin:
             captures = getattr(worker, "_prime_hidden_state_captures", {})
             if captures:
                 runner = worker.model_runner
+                captured_any = False
                 for req_id in list(getattr(runner.input_batch, "req_ids", [])):
                     capture = captures.get(req_id)
                     if capture is None:
@@ -77,6 +78,14 @@ class HiddenStateScoringMixin:
                     target_dtype = getattr(torch, capture["dtype"])
                     chunk = hidden_states[offset : offset + copy_len].detach().to(dtype=target_dtype).cpu().contiguous()
                     capture["chunks"][start_pos] = chunk
+                    captured_any = True
+
+                if captured_any:
+                    # This request uses prompt_logprobs only as a stable hook into
+                    # vLLM's normal prefill path. Returning an empty dict avoids
+                    # materializing real prompt-logprob tensors for 80k-token
+                    # teacher sequences, which would be wasteful and can OOM.
+                    return {}
 
             return original(hidden_states, num_scheduled_tokens, *args, **kwargs)
 

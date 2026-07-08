@@ -1,6 +1,9 @@
 import asyncio
+import base64
+import os
 import uuid
 from argparse import Namespace
+from pathlib import Path
 from typing import Any
 
 import uvloop
@@ -166,6 +169,9 @@ async def prefill_hidden_states(request: Request):
 
     hidden_request_id = f"prime-hidden-{uuid.uuid4().hex}"
     client = engine_client(request)
+    backend = os.environ.get("PRIME_RL_HIDDEN_STATE_BACKEND", "hook").strip().lower()
+    if backend in {"extractor", "vllm_extractor", "official_extractor"}:
+        return await prefill_hidden_states_with_extractor(request, token_ids, dtype, hidden_request_id)
 
     # Install capture before the request enters the scheduler. The request is
     # then executed by vLLM's normal prefill path, so DeepSeek/MLA attention sees
@@ -180,6 +186,7 @@ async def prefill_hidden_states(request: Request):
         temperature=0.0,
         top_p=1.0,
         detokenize=False,
+        prompt_logprobs=1,
     )
     async for _ in client.generate(
         TokensPrompt(prompt_token_ids=token_ids),
@@ -197,6 +204,109 @@ async def prefill_hidden_states(request: Request):
     if result is None:
         return JSONResponse({"error": "hidden-state scorer returned no result"}, status_code=500)
     return result
+
+
+async def prefill_hidden_states_with_extractor(
+    request: Request,
+    token_ids: list[int],
+    dtype: str,
+    request_id: str,
+):
+    """Capture teacher hidden states with vLLM's official extractor connector.
+
+    This backend requires the server to start with an ``extract_hidden_states``
+    speculative config and an ``ExampleHiddenStatesConnector`` kv-transfer
+    config. It is opt-in because vLLM documents the last-layer extractor output
+    as pre-output-norm; the hook backend remains the default full-vocab KL
+    signal until we verify model-specific equivalence to the teacher LM-head
+    input.
+    """
+    client = engine_client(request)
+    sampling_params = SamplingParams(
+        max_tokens=1,
+        temperature=0.0,
+        top_p=1.0,
+        detokenize=False,
+        extra_args={"kv_transfer_params": {"include_output_tokens": False}},
+    )
+    final_output = None
+    async for output in client.generate(
+        TokensPrompt(prompt_token_ids=token_ids),
+        sampling_params,
+        request_id,
+        priority=0,
+    ):
+        final_output = output
+
+    kv_params = getattr(final_output, "kv_transfer_params", None) if final_output is not None else None
+    hidden_path = (kv_params or {}).get("hidden_states_path") if isinstance(kv_params, dict) else None
+    if not hidden_path:
+        return JSONResponse(
+            {
+                "error": "vLLM extractor did not return hidden_states_path",
+                "kv_transfer_params": kv_params,
+            },
+            status_code=500,
+        )
+
+    try:
+        from safetensors.torch import load_file
+
+        tensors = load_file(hidden_path)
+        hidden_states = tensors["hidden_states"]
+        saved_token_ids = tensors.get("token_ids")
+    except Exception as exc:
+        return JSONResponse(
+            {
+                "error": f"failed to load extractor hidden states: {exc}",
+                "hidden_states_path": hidden_path,
+            },
+            status_code=500,
+        )
+    finally:
+        try:
+            Path(hidden_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    if hidden_states.dim() == 3:
+        if hidden_states.shape[1] != 1:
+            return JSONResponse(
+                {
+                    "error": "expected one extracted hidden-state layer",
+                    "shape": list(hidden_states.shape),
+                },
+                status_code=500,
+            )
+        hidden_states = hidden_states[:, 0, :]
+    if hidden_states.dim() != 2:
+        return JSONResponse(
+            {"error": "expected extractor hidden states with shape [seq, hidden]", "shape": list(hidden_states.shape)},
+            status_code=500,
+        )
+    if int(hidden_states.shape[0]) != len(token_ids):
+        saved_len = int(saved_token_ids.numel()) if saved_token_ids is not None else None
+        return JSONResponse(
+            {
+                "error": "extractor hidden-state length mismatch",
+                "expected": len(token_ids),
+                "hidden_shape": list(hidden_states.shape),
+                "saved_token_ids": saved_len,
+            },
+            status_code=500,
+        )
+
+    import torch
+
+    target_dtype = getattr(torch, dtype)
+    hidden_cpu = hidden_states.detach().to(dtype=target_dtype, device="cpu").contiguous()
+    raw = hidden_cpu.view(torch.uint8).numpy().tobytes()
+    return {
+        "dtype": dtype,
+        "shape": list(hidden_cpu.shape),
+        "data": base64.b64encode(raw).decode("ascii"),
+        "backend": "vllm_extractor",
+    }
 
 
 async def custom_init_app_state(
