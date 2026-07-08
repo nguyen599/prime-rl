@@ -56,8 +56,17 @@ class HiddenStateScoringMixin:
                 completed_capture_req_ids: list[str] = []
                 for req_id in list(getattr(runner.input_batch, "req_ids", [])):
                     capture = captures.get(req_id)
+                    if capture is None and len(captures) == 1:
+                        # Some vLLM versions/adapters rewrite the internal
+                        # request id before it reaches the model runner. The
+                        # full-vocab OPD teacher path is serialized by
+                        # PRIME_RL_PREFILL_HIDDEN_CONCURRENCY=1, so when there
+                        # is exactly one active capture it is the hidden-state
+                        # request currently being prefetched.
+                        _, capture = next(iter(captures.items()))
                     if capture is None:
                         continue
+                    capture.setdefault("seen_req_ids", set()).add(str(req_id))
                     num_tokens = num_scheduled_tokens.get(req_id) if isinstance(num_scheduled_tokens, dict) else None
                     if num_tokens is None:
                         continue
@@ -117,6 +126,7 @@ class HiddenStateScoringMixin:
             "target_len": int(target_len),
             "dtype": dtype,
             "chunks": {},
+            "seen_req_ids": set(),
         }
 
     def pop_hidden_state_capture(self, request_id: str) -> dict[str, Any] | None:
@@ -129,7 +139,11 @@ class HiddenStateScoringMixin:
         target_len = int(capture["target_len"])
         chunks: dict[int, torch.Tensor] = capture["chunks"]
         if not chunks:
-            raise RuntimeError(f"no hidden-state chunks captured for request {request_id!r}")
+            seen_req_ids = sorted(str(req_id) for req_id in capture.get("seen_req_ids", []))
+            raise RuntimeError(
+                f"no hidden-state chunks captured for request {request_id!r}; "
+                f"seen_model_runner_req_ids={seen_req_ids}"
+            )
 
         ordered: list[torch.Tensor] = []
         expected = 0
