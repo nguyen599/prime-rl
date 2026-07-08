@@ -107,6 +107,33 @@ from .configuration_olmo3_sink import Olmo3SinkConfig
 from .converting_olmo3_sink import convert_layer_to_vllm_kernel
 
 
+def _call_rope_init_for_layer(
+    rope_init_fn: Callable,
+    config: Olmo3SinkConfig,
+    layer_config: Olmo3SinkConfig,
+    device,
+    layer_type: str | None,
+) -> tuple[torch.Tensor, float]:
+    """Call RoPE init across Transformers versions.
+
+    Transformers 5.13+ expects the original nested `rope_parameters` config
+    plus `layer_type=...`. Older versions do not accept that kwarg and need the
+    flattened per-layer config.
+    """
+
+    if layer_type is not None:
+        try:
+            return rope_init_fn(config, device, layer_type=layer_type)
+        except TypeError as exc:
+            if "layer_type" not in str(exc) and "unexpected keyword" not in str(exc):
+                raise
+        except KeyError as exc:
+            if exc.args and exc.args[0] not in (layer_type, None, "rope_type", "rope_theta"):
+                raise
+
+    return rope_init_fn(layer_config, device)
+
+
 # OLMo 3 RoPE is identical to the stock rotary embedding, except:
 # - RoPE scaling is not applied to sliding window attention layers.
 class Olmo3SinkRotaryEmbedding(Olmo3RotaryEmbedding):
@@ -146,7 +173,13 @@ class Olmo3SinkRotaryEmbedding(Olmo3RotaryEmbedding):
             rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
         layer_config = copy(self.config)
         layer_config.rope_parameters = rope_parameters
-        inv_freq, self.attention_scaling = rope_init_fn(layer_config, device)
+        inv_freq, self.attention_scaling = _call_rope_init_for_layer(
+            rope_init_fn,
+            self.config,
+            layer_config,
+            device,
+            layer_type,
+        )
 
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
