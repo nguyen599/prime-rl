@@ -151,6 +151,22 @@ def _call_rope_init_for_layer(
     return rope_init_fn(layer_config, device)
 
 
+def _call_rope_forward_for_layer(
+    rotary_emb: Olmo3RotaryEmbedding,
+    hidden_states: torch.Tensor,
+    position_ids: torch.LongTensor,
+    layer_type: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Call RoPE forward across Transformers versions."""
+
+    try:
+        return rotary_emb(hidden_states, position_ids, layer_type=layer_type)
+    except TypeError as exc:
+        if "layer_type" not in str(exc) and "unexpected keyword" not in str(exc):
+            raise
+    return rotary_emb(hidden_states, position_ids)
+
+
 # OLMo 3 RoPE is identical to the stock rotary embedding, except:
 # - RoPE scaling is not applied to sliding window attention layers.
 class Olmo3SinkRotaryEmbedding(Olmo3RotaryEmbedding):
@@ -420,8 +436,18 @@ class Olmo3SinkModel(Olmo3SinkPreTrainedModel, Olmo3Model):
 
         hidden_states = inputs_embeds
         position_embeddings_mapping = {
-            "sliding_attention": self.rotary_embs["sliding_attention"](hidden_states, position_ids),
-            "full_attention": self.rotary_embs["full_attention"](hidden_states, position_ids),
+            "sliding_attention": _call_rope_forward_for_layer(
+                self.rotary_embs["sliding_attention"],
+                hidden_states,
+                position_ids,
+                "sliding_attention",
+            ),
+            "full_attention": _call_rope_forward_for_layer(
+                self.rotary_embs["full_attention"],
+                hidden_states,
+                position_ids,
+                "full_attention",
+            ),
         }
 
         for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
