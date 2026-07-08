@@ -28,6 +28,7 @@ class OPDAlgorithm(Algorithm):
 
     def __init__(self, config: OPDAlgoConfig, policy_pool: InferencePool):
         super().__init__(config, policy_pool)
+        self.opd_config = config
         self.teacher = config.teacher
         self.teacher_pool: StaticInferencePool | None = None  # static teacher endpoint, connected in setup()
 
@@ -43,8 +44,10 @@ class OPDAlgorithm(Algorithm):
 
         async def score_sample(sample: TrainingSample) -> None:
             token_ids = list(sample.token_ids)
-            if self.config.distill_mode == "full_vocab_hidden":
-                sample.ref_hidden_states = await pool.score_hidden_states(token_ids, dtype=self.config.teacher_hidden_dtype)
+            if self.opd_config.distill_mode == "full_vocab_hidden":
+                sample.ref_hidden_states = await pool.score_hidden_states(
+                    token_ids, dtype=self.opd_config.teacher_hidden_dtype
+                )
                 sample.ref_logprobs = None
             else:
                 sample.ref_logprobs = await pool.score(token_ids)
