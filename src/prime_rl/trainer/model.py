@@ -1033,21 +1033,33 @@ def _layer_rope_config(config, layer_type: str | None):
     return config
 
 
+def _nested_rope_config(config, layer_config, layer_type: str | None):
+    raw_parameters = getattr(layer_config, "rope_parameters", None)
+    if not isinstance(raw_parameters, dict):
+        return config
+    nested_config = copy(config)
+    nested_config.rope_parameters = {layer_type: dict(raw_parameters)}
+    return nested_config
+
+
 def _reinit_rotary_embedding_buffers(rotary_emb: nn.Module, *, copy_original_inv_freq: bool) -> None:
     inv_freq_buffer = rotary_emb.inv_freq
     rope_init_fn = _rope_init_fn_for_rotary_emb(rotary_emb)
     config = rotary_emb.config
     layer_type = getattr(rotary_emb, "layer_type", None)
     layer_config = _layer_rope_config(config, layer_type)
+    nested_config = _nested_rope_config(config, layer_config, layer_type)
     try:
-        if layer_type is None:
-            inv_freq, attention_scaling = rope_init_fn(config, inv_freq_buffer.device)
-        else:
-            inv_freq, attention_scaling = rope_init_fn(layer_config, inv_freq_buffer.device, layer_type=layer_type)
+        inv_freq, attention_scaling = rope_init_fn(nested_config, inv_freq_buffer.device, layer_type=layer_type)
     except (KeyError, TypeError) as exc:
-        if layer_type is None:
-            raise
         if isinstance(exc, TypeError) and "layer_type" not in str(exc) and "unexpected keyword" not in str(exc):
+            raise
+        if isinstance(exc, KeyError) and exc.args and exc.args[0] not in (
+            layer_type,
+            None,
+            "rope_type",
+            "rope_theta",
+        ):
             raise
         inv_freq, attention_scaling = rope_init_fn(layer_config, inv_freq_buffer.device)
     rotary_emb.inv_freq.copy_(inv_freq)

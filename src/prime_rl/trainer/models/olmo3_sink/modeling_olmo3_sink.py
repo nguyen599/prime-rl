@@ -121,15 +121,16 @@ def _call_rope_init_for_layer(
     flattened per-layer config.
     """
 
-    if layer_type is not None:
-        try:
-            return rope_init_fn(config, device, layer_type=layer_type)
-        except TypeError as exc:
-            if "layer_type" not in str(exc) and "unexpected keyword" not in str(exc):
-                raise
-        except KeyError as exc:
-            if exc.args and exc.args[0] not in (layer_type, None, "rope_type", "rope_theta"):
-                raise
+    nested_config = copy(config)
+    nested_config.rope_parameters = {layer_type: dict(layer_config.rope_parameters)}
+    try:
+        return rope_init_fn(nested_config, device, layer_type=layer_type)
+    except TypeError as exc:
+        if "layer_type" not in str(exc) and "unexpected keyword" not in str(exc):
+            raise
+    except KeyError as exc:
+        if exc.args and exc.args[0] not in (layer_type, None, "rope_type", "rope_theta"):
+            raise
 
     return rope_init_fn(layer_config, device)
 
