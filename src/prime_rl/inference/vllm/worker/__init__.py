@@ -6,6 +6,7 @@ from prime_rl.inference.patches import (
     monkey_patch_fp32_router_logits,
     monkey_patch_minimax_m2_for_lora,
     monkey_patch_no_moe_lora,
+    monkey_patch_skip_deepseek_v4_sparse_mla_warmup,
     register_olmo3_sink_model,
 )
 
@@ -28,3 +29,7 @@ monkey_patch_fp32_lm_head()
 
 # Install fp32 router logits patch; self-gates on additional_config["fp32_router_logits"]
 monkey_patch_fp32_router_logits()
+# Optional DeepSeek-V4 startup warmup skip. This worker module is imported in
+# each vLLM worker-extension process before model warmup, so patching here is
+# more reliable than relying on a sitecustomize shim.
+monkey_patch_skip_deepseek_v4_sparse_mla_warmup()

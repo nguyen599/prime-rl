@@ -1,4 +1,5 @@
 import logging
+import os
 
 import torch
 
@@ -25,6 +26,36 @@ def apply_shared_vllm_patches():
     monkey_patch_return_routed_experts_with_nixl_connector()
     monkey_patch_kv_xfer_finished_tolerate_freed()
     register_olmo3_sink_model()
+    monkey_patch_skip_deepseek_v4_sparse_mla_warmup()
+
+
+def monkey_patch_skip_deepseek_v4_sparse_mla_warmup():
+    """Optionally skip DeepSeek-V4 sparse MLA startup warmup in vLLM workers.
+
+    The warmup path runs synthetic dummy prefill requests during vLLM worker
+    startup. On some H200 clusters it can fail with a CUDA invalid-resource
+    handle while the normal DeepSeek-V4 runtime path is otherwise usable. Keep
+    the behavior opt-in via env so ordinary Prime-RL deployments are unchanged.
+    """
+    if os.environ.get("VLLM_SKIP_DEEPSEEK_V4_SPARSE_MLA_WARMUP", "0") != "1":
+        return
+
+    try:
+        import vllm.model_executor.warmup.kernel_warmup as kernel_warmup
+    except Exception as exc:
+        logger.warning("Could not import vLLM kernel_warmup for DeepSeek-V4 warmup skip: %s", exc)
+        return
+
+    if getattr(kernel_warmup.deepseek_v4_sparse_mla_attention_warmup, "_prime_rl_skips_sparse_mla", False):
+        return
+
+    def _skip_sparse_mla_warmup(worker):
+        logger.warning("Skipping DeepSeek-V4 sparse MLA startup warmup by PRIME-RL patch.")
+        return None
+
+    _skip_sparse_mla_warmup._prime_rl_skips_sparse_mla = True
+    kernel_warmup.flashinfer_sparse_mla_decode_autotune_warmup = _skip_sparse_mla_warmup
+    kernel_warmup.deepseek_v4_sparse_mla_attention_warmup = _skip_sparse_mla_warmup
 
 
 def register_olmo3_sink_model() -> None:
