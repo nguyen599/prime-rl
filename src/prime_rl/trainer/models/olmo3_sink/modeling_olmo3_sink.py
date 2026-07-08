@@ -218,6 +218,29 @@ class Olmo3SinkRotaryEmbedding(Olmo3RotaryEmbedding):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
 
+    @torch.no_grad()
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.LongTensor,
+        layer_type: str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Transformers 5.13's parent forward expects per-layer buffers named
+        # like `sliding_attention_inv_freq`. This wrapper intentionally stores a
+        # single per-instance `inv_freq`, so compute RoPE directly from it.
+        del layer_type
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
 
 class Olmo3SinkAttention(Olmo3Attention):
     """Olmo3 attention + per-head learnable sink (`s_aux`)."""
