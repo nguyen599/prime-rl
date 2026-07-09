@@ -30,6 +30,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.models.interfaces import EagleModelMixin, SupportsEagle3
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.olmo2 import (
     Olmo2MLP,
@@ -226,7 +227,7 @@ class Olmo3SinkDecoderLayer(nn.Module):
         "inputs_embeds": 0,
     }
 )
-class Olmo3SinkModel(nn.Module):
+class Olmo3SinkModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -254,7 +255,7 @@ class Olmo3SinkModel(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -265,13 +266,22 @@ class Olmo3SinkModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             assert isinstance(hidden_states, torch.Tensor)
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        aux_hidden_states: list[torch.Tensor] = []
+        if 0 in self.aux_hidden_state_layers:
+            aux_hidden_states.append(hidden_states)
+
+        for idx, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
             hidden_states = layer(positions, hidden_states)
+            layer_id = self.start_layer + idx + 1
+            if layer_id in self.aux_hidden_state_layers:
+                aux_hidden_states.append(hidden_states)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
         hidden_states = self.norm(hidden_states)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -308,7 +318,7 @@ class Olmo3SinkModel(nn.Module):
         return loaded_params
 
 
-class Olmo3SinkForCausalLM(nn.Module):
+class Olmo3SinkForCausalLM(nn.Module, SupportsEagle3):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -339,13 +349,20 @@ class Olmo3SinkForCausalLM(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         return self.model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
         )
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model._set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)

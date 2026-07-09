@@ -78,8 +78,12 @@ def register_olmo3_sink_model() -> None:
         "Olmo3SinkForCausalLM",
         "prime_rl.trainer.models.olmo3_sink.vllm_adapter:Olmo3SinkForCausalLM",
     )
+    ModelRegistry.register_model(
+        "DFlashDraftModel",
+        "prime_rl.trainer.models.olmo3_sink.vllm_dflash_adapter:DFlashDraftModel",
+    )
     _OLMO3_SINK_VLLM_REGISTERED = True
-    logger.info("Registered Olmo3SinkForCausalLM for vLLM.")
+    logger.info("Registered Olmo3SinkForCausalLM and DFlashDraftModel for vLLM.")
 
 
 def monkey_patch_kv_xfer_finished_tolerate_freed():
