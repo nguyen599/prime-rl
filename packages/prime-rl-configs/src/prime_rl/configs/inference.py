@@ -48,6 +48,9 @@ class ModelConfig(BaseModelConfig):
     max_model_len: int | None = None
     """Maximum model context length. If None, uses the model config's value. Forwarded as ``--max-model-len``."""
 
+    tokenizer: str | None = None
+    """Optional tokenizer name or local path. Forwarded as ``--tokenizer`` when different from the model path."""
+
     enforce_eager: bool = False
     """Enforce eager mode. When False, PyTorch eager and cuda graphs run hybrid for maximum performance. Forwarded as ``--enforce-eager``."""
 
@@ -566,6 +569,7 @@ class InferenceConfig(BaseConfig):
             "server.port": "port",
             "server.liveness_timeout_seconds": "liveness_timeout_seconds",
             "model.name": "model",
+            "model.tokenizer": "tokenizer",
             "model.dtype": "dtype",
             "model.max_model_len": "max_model_len",
             "model.enforce_eager": "enforce_eager",
@@ -619,6 +623,10 @@ class InferenceConfig(BaseConfig):
         # Remove chat_template if not set (vLLM doesn't accept None)
         if namespace.chat_template is None:
             delattr(namespace, "chat_template")
+
+        # Remove tokenizer if not set (vLLM defaults to model path).
+        if namespace.tokenizer is None:
+            delattr(namespace, "tokenizer")
 
         # Remove tool_call_parser if not set (vLLM doesn't accept None) and gate
         # `enable_auto_tool_choice` on its presence.
