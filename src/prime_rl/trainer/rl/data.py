@@ -16,7 +16,7 @@ from prime_rl.transport import (
     TransportConfig,
     setup_micro_batch_receiver,
 )
-from prime_rl.transport.hidden_state_files import materialize_tensor_files
+from prime_rl.transport.hidden_state_files import materialize_tensor_files, unlink_owned_tensor_files
 
 
 class TensorMicroBatch(TypedDict):
@@ -219,7 +219,20 @@ class DataLoader:
 
     def get_batch(self) -> list[TensorMicroBatch]:
         micro_batches = self.receiver.receive()
-        return [self._micro_batch_to_tensor(mb) for mb in micro_batches]
+        tensor_micro_batches = [self._micro_batch_to_tensor(mb) for mb in micro_batches]
+
+        # A model-parallel trainer can have more than one process opening the
+        # same rank-local batch during startup and topology transitions. Keep
+        # every private hard link alive until all ranks have finished mmaping
+        # their batch, then clean up. Unlinking inside materialization lets a
+        # faster rank remove a path before a slower peer opens it.
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        for micro_batch in micro_batches:
+            if micro_batch.ref_hidden_state_files is not None:
+                unlink_owned_tensor_files(micro_batch.ref_hidden_state_files)
+
+        return tensor_micro_batches
 
     def _micro_batch_to_tensor(self, micro_batch: MicroBatch) -> TensorMicroBatch:
         """Convert a MicroBatch (msgspec struct with lists) to a TensorMicroBatch (dict with tensors)."""
@@ -242,6 +255,7 @@ class DataLoader:
             ref_hidden_states = materialize_tensor_files(
                 micro_batch.ref_hidden_state_files,
                 expected_rows=len(micro_batch.input_ids),
+                unlink_owned=False,
             ).unsqueeze(0)
         mm_kwargs: dict[str, Tensor] | None = None
         if micro_batch.mm_kwargs:

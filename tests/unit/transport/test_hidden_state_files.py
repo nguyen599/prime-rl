@@ -10,6 +10,7 @@ from prime_rl.transport.hidden_state_files import (
     copy_tensor_file_reference,
     materialize_tensor_files,
     slice_tensor_file_rows,
+    unlink_owned_tensor_files,
     write_tensor_chunks_file,
     write_tensor_file,
 )
@@ -103,6 +104,25 @@ def test_filesystem_hidden_states_stay_as_handles_through_packing(tmp_path: Path
     expected = torch.cat([second_values, first_values, torch.zeros((3, 3), dtype=torch.float16)])
     torch.testing.assert_close(result, expected)
     assert all(not path.exists() for path in private_paths)
+
+
+def test_private_links_survive_until_all_readers_materialize(tmp_path: Path):
+    values = torch.arange(12, dtype=torch.bfloat16).reshape(4, 3)
+    source = tmp_path / "source.prlhs"
+    ref = write_tensor_file(source, values)
+    private = tmp_path / "private.prlhs"
+    os.link(source, private)
+    private_ref = copy_tensor_file_reference(ref, unlink_after_read=True)
+    private_ref.path = str(private)
+
+    first = materialize_tensor_files([private_ref], expected_rows=4, unlink_owned=False)
+    assert private.exists()
+    second = materialize_tensor_files([private_ref], expected_rows=4, unlink_owned=False)
+    unlink_owned_tensor_files([private_ref])
+
+    torch.testing.assert_close(first, values)
+    torch.testing.assert_close(second, values)
+    assert not private.exists()
 
 
 def test_prepare_batch_truncates_file_reference_without_reading_payload(tmp_path: Path):

@@ -85,9 +85,10 @@ Set `teacher_lm_head_key` when using a checkpoint with a non-standard key.
    filesystem microbatch sender creates a private hard link for each owning
    trainer rank, then removes the producer name.
 6. The trainer loads the teacher LM head once at startup.
-7. The owning trainer rank memory-maps its file segments, concatenates them in
-   packed-token order, fills only padding rows with zeros, and unlinks its
-   private handles.
+7. Trainer ranks memory-map their file segments, concatenate them in
+   packed-token order, and fill only padding rows with zeros. The ranks then
+   synchronize before unlinking private handles, so a faster process cannot
+   remove a shared rank-local path before a slower process opens it.
 8. During the model forward, `FusedOutputLinear` computes normal sampled-token
    logprobs and the optional full-vocab KL loss.
 9. The full-vocab KL is normalized by the global `ref_kl` token count, matching

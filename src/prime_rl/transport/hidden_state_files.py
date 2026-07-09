@@ -203,6 +203,15 @@ def map_tensor_file(ref: TensorFileReference) -> torch.Tensor:
     return payload.view(dtype).reshape(ref.shape)
 
 
+def unlink_owned_tensor_files(refs: Iterable[TensorFileReference]) -> None:
+    """Remove private consumer links after every trainer rank has mapped them."""
+    for path in {ref.path for ref in refs if ref.unlink_after_read}:
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def materialize_tensor_files(
     refs: list[TensorFileReference], expected_rows: int, *, unlink_owned: bool = True
 ) -> torch.Tensor:
@@ -215,7 +224,6 @@ def materialize_tensor_files(
     trailing_shape = refs[0].shape[1:]
     tensors: list[torch.Tensor] = []
     rows = 0
-    owned_paths: set[str] = set()
     for ref in refs:
         if normalize_dtype(ref.dtype) != dtype or ref.shape[1:] != trailing_shape:
             raise ValueError(
@@ -224,8 +232,6 @@ def materialize_tensor_files(
             )
         tensors.append(map_tensor_file(ref))
         rows += int(ref.shape[0])
-        if ref.unlink_after_read:
-            owned_paths.add(ref.path)
     if rows > expected_rows:
         raise ValueError(f"filesystem hidden states have {rows} rows for a {expected_rows}-token microbatch")
     if rows < expected_rows:
@@ -235,11 +241,7 @@ def materialize_tensor_files(
     # Private hard links can be removed after mmap/cat. POSIX mappings retain
     # the inode until the tensor is released.
     if unlink_owned:
-        for path in owned_paths:
-            try:
-                Path(path).unlink(missing_ok=True)
-            except OSError:
-                pass
+        unlink_owned_tensor_files(refs)
     return result
 
 
