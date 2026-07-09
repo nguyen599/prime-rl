@@ -494,6 +494,33 @@ class DFlashOlmo3SinkModel(nn.Module):
         offset_name = f"layers.{layer_idx + self.start_layer_id}.{parts[2]}"
         return offset_name
 
+    def _layer_name_candidates(self, name: str) -> list[str]:
+        if self.start_layer_id <= 0 or not name.startswith("layers."):
+            return [name]
+        parts = name.split(".", 2)
+        if len(parts) < 3 or not parts[1].isdigit():
+            return [name]
+
+        layer_idx = int(parts[1])
+        rest = parts[2]
+        candidates = [name, f"layers.{layer_idx + self.start_layer_id}.{rest}"]
+        if layer_idx >= self.start_layer_id:
+            candidates.append(f"layers.{layer_idx - self.start_layer_id}.{rest}")
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            if candidate not in seen:
+                deduped.append(candidate)
+                seen.add(candidate)
+        return deduped
+
+    def _resolve_param_name(self, name: str, params_dict: dict[str, nn.Parameter]) -> str | None:
+        for candidate in self._layer_name_candidates(name):
+            if candidate in params_dict:
+                return candidate
+        return None
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             (".qkv_proj", ".q_proj", "q"),
@@ -506,15 +533,24 @@ class DFlashOlmo3SinkModel(nn.Module):
         loaded_params: set[str] = set()
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
+        skipped_weights: list[str] = []
 
         for name, loaded_weight in weights:
-            name = self._offset_layer_name(name)
+            original_name = name
             if "scale" in name:
-                name = maybe_remap_kv_scale_name(name, params_dict)
+                name = next(
+                    (
+                        remapped
+                        for candidate in self._layer_name_candidates(name)
+                        if (remapped := maybe_remap_kv_scale_name(candidate, params_dict)) is not None
+                    ),
+                    None,
+                )
                 if name is None:
                     continue
             if name.endswith(".self_attn.sinks"):
-                if name not in params_dict:
+                name = self._resolve_param_name(name, params_dict)
+                if name is None:
                     continue
                 param = params_dict[name]
                 heads_per_rank = loaded_weight.shape[0] // tp_size
@@ -526,18 +562,31 @@ class DFlashOlmo3SinkModel(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                name = name.replace(weight_name, param_name)
+                resolved_name = self._resolve_param_name(name.replace(weight_name, param_name), params_dict)
+                if resolved_name is None:
+                    skipped_weights.append(original_name)
+                    break
+                name = resolved_name
                 param = params_dict[name]
                 param.weight_loader(param, loaded_weight, shard_id)
                 loaded_params.add(name)
                 break
             else:
-                if name not in params_dict:
-                    raise KeyError(f"Unexpected OLMo3Sink DFlash weight {name!r}")
+                name = self._resolve_param_name(name, params_dict)
+                if name is None:
+                    skipped_weights.append(original_name)
+                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
+
+        if skipped_weights:
+            logger.warning(
+                "Skipped %d unexpected OLMo3Sink DFlash weight(s); first few: %s",
+                len(skipped_weights),
+                skipped_weights[:8],
+            )
 
         return loaded_params
 
