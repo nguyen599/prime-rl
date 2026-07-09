@@ -222,3 +222,6 @@ def grouped_fp8_gemm(
         (M, N) output tensor in bfloat16.
     """
     return _GroupedFP8Gemm.apply(x, weight, offs)
+
+
+grouped_fp8_gemm = torch.compiler.disable()(grouped_fp8_gemm)

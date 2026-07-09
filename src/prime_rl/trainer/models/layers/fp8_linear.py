@@ -92,7 +92,11 @@ class Float8BlockwiseLinear(nn.Linear):
         super().__init__(*args, **kwargs)
         self.block_size = block_size
 
+    @torch.compiler.disable()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # DeepGEMM exposes pybind kernels that Dynamo warns about and can spend
+        # unbounded time trying to trace inside compiled transformer blocks.
+        # Keep the surrounding block compile, but run this FP8 matmul eagerly.
         return _FP8BlockwiseMM.apply(x, self.weight, self.block_size, torch.bfloat16)
 
     @classmethod
