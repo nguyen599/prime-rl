@@ -22,6 +22,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from prime_rl.configs.inference import InferenceConfig
+from prime_rl.transport.hidden_state_files import write_tensor_file
 from prime_rl.utils.logger import get_logger
 
 logger = get_logger()
@@ -165,13 +166,23 @@ async def prefill_hidden_states(request: Request):
     token_ids = data.get("token_ids")
     if not isinstance(token_ids, list):
         return JSONResponse({"error": "token_ids must be a list"}, status_code=400)
-    dtype = data.get("dtype", "float16")
+    dtype = data.get("dtype", "bfloat16")
+    transport = str(data.get("transport", "inline")).strip().lower()
+    if transport not in {"inline", "filesystem"}:
+        return JSONResponse({"error": f"unsupported hidden-state transport {transport!r}"}, status_code=400)
+    output_path = data.get("output_path") if transport == "filesystem" else None
+    if output_path is not None and not Path(output_path).is_absolute():
+        return JSONResponse({"error": "filesystem output_path must be absolute"}, status_code=400)
+    if transport == "filesystem" and not output_path:
+        return JSONResponse({"error": "filesystem transport requires output_path"}, status_code=400)
 
     hidden_request_id = f"prime-hidden-{uuid.uuid4().hex}"
     client = engine_client(request)
     backend = os.environ.get("PRIME_RL_HIDDEN_STATE_BACKEND", "hook").strip().lower()
     if backend in {"extractor", "vllm_extractor", "official_extractor"}:
-        return await prefill_hidden_states_with_extractor(request, token_ids, dtype, hidden_request_id)
+        return await prefill_hidden_states_with_extractor(
+            request, token_ids, dtype, hidden_request_id, output_path=output_path
+        )
 
     # Install capture before the request enters the scheduler. The request is
     # then executed by vLLM's normal prefill path, so DeepSeek/MLA attention sees
@@ -196,7 +207,7 @@ async def prefill_hidden_states(request: Request):
     ):
         pass
 
-    results = await client.collective_rpc("pop_hidden_state_capture", args=(hidden_request_id,))
+    results = await client.collective_rpc("pop_hidden_state_capture", args=(hidden_request_id, output_path))
     if isinstance(results, list):
         result = next((item for item in results if item is not None), None)
     else:
@@ -211,6 +222,7 @@ async def prefill_hidden_states_with_extractor(
     token_ids: list[int],
     dtype: str,
     request_id: str,
+    output_path: str | None = None,
 ):
     """Capture teacher hidden states with vLLM's official extractor connector.
 
@@ -300,6 +312,17 @@ async def prefill_hidden_states_with_extractor(
 
     target_dtype = getattr(torch, dtype)
     hidden_cpu = hidden_states.detach().to(dtype=target_dtype, device="cpu").contiguous()
+    if output_path is not None:
+        ref = write_tensor_file(output_path, hidden_cpu)
+        return {
+            "transport": "filesystem",
+            "path": ref.path,
+            "dtype": ref.dtype,
+            "shape": ref.shape,
+            "offset": ref.offset,
+            "nbytes": ref.nbytes,
+            "backend": "vllm_extractor",
+        }
     raw = hidden_cpu.view(torch.uint8).numpy().tobytes()
     return {
         "dtype": dtype,

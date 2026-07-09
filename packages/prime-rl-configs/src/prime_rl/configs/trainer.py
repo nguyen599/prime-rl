@@ -567,7 +567,7 @@ class FullVocabDistillConfig(BaseConfig):
     vocab_chunk_size: int = Field(8192, ge=1)
     """Vocabulary chunk size used by the full-vocab KL computation."""
 
-    teacher_hidden_dtype: Literal["float16", "bfloat16", "float32"] = "float16"
+    teacher_hidden_dtype: Literal["float16", "bfloat16", "float32"] = "bfloat16"
     """dtype requested from the teacher hidden-state scorer."""
 
 

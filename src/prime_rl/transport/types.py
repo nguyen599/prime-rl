@@ -10,6 +10,24 @@ class EncodedTensor(msgspec.Struct, array_like=True, gc=False):
     data: bytes
 
 
+class TensorFileReference(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
+    """Reference to a dim-0-stacked tensor stored on a shared filesystem.
+
+    The file is written atomically by the producer. ``offset`` and ``nbytes``
+    describe the visible payload, allowing the packer to truncate a sample by
+    editing metadata only. ``unlink_after_read`` is set only after the
+    filesystem microbatch sender gives an owning trainer rank a private hard
+    link, so readers never race each other while cleaning up.
+    """
+
+    path: str
+    dtype: str
+    shape: list[int]
+    offset: int
+    nbytes: int
+    unlink_after_read: bool = False
+
+
 # Routed experts are large per-token arrays. tolist() is too expensive, so we
 # send raw bytes through msgpack and carry the shape/dtype needed to rebuild.
 class RoutedExperts(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
@@ -74,6 +92,10 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
     # samples without live rl member tokens (the trainer raises otherwise).
     advantages: list[float] | None = None
 
+    # Opt-in shared-filesystem alternative to ``ref_hidden_states``. Appended
+    # to preserve the positional msgpack layout of existing fields.
+    ref_hidden_states_file: TensorFileReference | None = None
+
 
 class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     """A batch of training examples with metadata for transport."""
@@ -115,3 +137,7 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     # Packer-derived metadata used for run-local token exports.
     run_id: str | None = None
     run_step: int | None = None
+
+    # Ordered dim-0 segments for a filesystem-backed packed hidden tensor.
+    # Padding rows are implicit and materialized as zeros by the trainer.
+    ref_hidden_state_files: list[TensorFileReference] | None = None

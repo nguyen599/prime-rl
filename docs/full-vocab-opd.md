@@ -42,7 +42,9 @@ Enable it under `[orchestrator.algo]` and `[trainer.full_vocab_distill]`:
 [orchestrator.algo]
 type = "opd"
 distill_mode = "full_vocab_hidden"
-teacher_hidden_dtype = "float16"
+teacher_hidden_dtype = "bfloat16"
+teacher_hidden_transport = "filesystem"
+teacher_hidden_path = "/shared/prime-rl/teacher-hidden/run-001"
 
 [orchestrator.algo.teacher]
 name = "/models/teacher"
@@ -54,7 +56,7 @@ enabled = true
 teacher_lm_head_path = "/models/teacher"
 token_chunk_size = 64
 vocab_chunk_size = 8192
-teacher_hidden_dtype = "float16"
+teacher_hidden_dtype = "bfloat16"
 ```
 
 If `teacher_lm_head_key` is not set, the trainer tries common HF keys in this
@@ -76,14 +78,19 @@ Set `teacher_lm_head_key` when using a checkpoint with a non-standard key.
 2. `OPDAlgorithm.score_rollout()` checks `distill_mode`.
 3. In default mode, it calls `InferencePool.score()` and fills
    `sample.ref_logprobs`.
-4. In full-vocab mode, it calls `InferencePool.score_hidden_states()` and fills
-   `sample.ref_hidden_states`.
-5. The packer truncates, pads, and packs `ref_hidden_states` so rows stay aligned
-   with `input_ids`.
+4. In full-vocab inline mode, it fills `sample.ref_hidden_states`. In filesystem
+   mode, the teacher atomically writes a self-describing tensor file and the
+   orchestrator receives only `sample.ref_hidden_states_file` metadata.
+5. The packer truncates file references by changing metadata only. The
+   filesystem microbatch sender creates a private hard link for each owning
+   trainer rank, then removes the producer name.
 6. The trainer loads the teacher LM head once at startup.
-7. During the model forward, `FusedOutputLinear` computes normal sampled-token
+7. The owning trainer rank memory-maps its file segments, concatenates them in
+   packed-token order, fills only padding rows with zeros, and unlinks its
+   private handles.
+8. During the model forward, `FusedOutputLinear` computes normal sampled-token
    logprobs and the optional full-vocab KL loss.
-8. The full-vocab KL is normalized by the global `ref_kl` token count, matching
+9. The full-vocab KL is normalized by the global `ref_kl` token count, matching
    the existing component-normalization behavior.
 
 ## vLLM Endpoint
@@ -94,18 +101,37 @@ Prime-RL adds a custom worker route:
 POST /prime_rl/prefill_hidden_states
 ```
 
-The route calls a worker RPC named `prefill_hidden_states` and returns an
-encoded tensor:
+The route calls a worker RPC named `prefill_hidden_states`. The legacy inline
+response is an encoded tensor:
 
 ```json
 {
-  "dtype": "float16",
+  "dtype": "bfloat16",
   "shape": [seq_len, hidden_size],
   "data": "<base64 raw tensor bytes>"
 }
 ```
 
 This endpoint is only used by `distill_mode = "full_vocab_hidden"`.
+
+With `teacher_hidden_transport = "filesystem"`, the request includes a unique
+absolute output path and the response is only a handle:
+
+```json
+{
+  "transport": "filesystem",
+  "path": "/shared/prime-rl/teacher-hidden/run-001/....prlhs",
+  "dtype": "bfloat16",
+  "shape": [40000, 4096],
+  "offset": 64,
+  "nbytes": 327680000
+}
+```
+
+With the default hook backend, the payload never enters the API server,
+orchestrator, training-batch msgpack, or packer process. The path must resolve
+to the same shared filesystem from all roles. The default remains `inline` for
+backward compatibility.
 
 ## Current Limits
 
@@ -120,8 +146,9 @@ Full-vocab OPD currently has conservative guards:
 - The teacher LM-head tensor must be available as HF safetensors.
 - The student and teacher vocabularies must be aligned. Hidden sizes may differ
   as long as each hidden state matches its own LM head.
-- Hidden states are transmitted as float16, bfloat16, or float32 raw tensor
-  bytes. There is no int6 hidden-state compression yet.
+- Hidden states are stored as float16, bfloat16, or float32 raw tensor bytes;
+  bfloat16 is the default. Filesystem transport removes the control-plane copy,
+  but there is no int6 hidden-state compression yet.
 
 These limits are intentional. They prevent silent wrong KL when trainer hidden
 states or LM-head weights are sharded in a layout the trainer does not yet
@@ -141,6 +168,18 @@ LM-head pass OOMs, and larger values if there is memory headroom.
 Only tokens with nonzero `ref_kl_weights` enter the full-vocab pass. Prompt,
 padding, CE-only, and masked tokens are skipped.
 
+For long-context or high-concurrency runs, use filesystem transport. Inline
+transport base64-encodes the full tensor over HTTP and then copies it through
+the orchestrator and packer, which is suitable only for compatibility and
+small smoke tests.
+
+Filesystem producer files are atomically written (`tmp` + rename). The
+filesystem microbatch sender hard-links each segment into the owning rank's
+step directory; the trainer removes that private link after mmap. Producer
+files left by crashes are swept after `PRIME_RL_HIDDEN_STATE_TTL_SECONDS`
+(default 21600 seconds), at most once per
+`PRIME_RL_HIDDEN_STATE_SWEEP_INTERVAL_SECONDS` (default 600 seconds).
+
 ## Troubleshooting
 
 `hidden-state scorer returned no result`
@@ -158,6 +197,11 @@ padding, CE-only, and masked tokens are skipped.
 `full-vocab OPD distillation requires ref_hidden_states`
 : The orchestrator was not running in `distill_mode = "full_vocab_hidden"`, or
   the teacher endpoint did not expose `/prime_rl/prefill_hidden_states`.
+
+`teacher_hidden_path is required for filesystem hidden-state transport`
+: Set one absolute directory that is mounted at the same path on the teacher
+  and trainer nodes. Do not use node-local `/tmp` unless the cluster mounts it
+  as shared storage.
 
 ## Backward Compatibility
 

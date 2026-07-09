@@ -1,9 +1,14 @@
 import base64
 import functools
+import os
+import time
+from pathlib import Path
 from typing import Any
 
 import torch
 from torch.nn import Module
+
+from prime_rl.transport.hidden_state_files import sweep_tensor_files, write_tensor_chunks_file
 
 
 class HiddenStateScoringMixin:
@@ -113,7 +118,7 @@ class HiddenStateScoringMixin:
         model_runner._get_prompt_logprobs_dict = wrapped_get_prompt_logprobs_dict
         model_runner._prime_hidden_capture_hook_installed = True
 
-    def prepare_hidden_state_capture(self, request_id: str, target_len: int, dtype: str = "float16") -> None:
+    def prepare_hidden_state_capture(self, request_id: str, target_len: int, dtype: str = "bfloat16") -> None:
         """Prepare the worker to capture hidden states from a normal vLLM prefill.
 
         The API server sends an internal generate request with ``prompt_logprobs``
@@ -129,7 +134,17 @@ class HiddenStateScoringMixin:
             "seen_req_ids": set(),
         }
 
-    def pop_hidden_state_capture(self, request_id: str) -> dict[str, Any] | None:
+    def _prime_maybe_sweep_hidden_files(self, directory: Path) -> None:
+        interval = float(os.environ.get("PRIME_RL_HIDDEN_STATE_SWEEP_INTERVAL_SECONDS", "600"))
+        now = time.monotonic()
+        last = float(getattr(self, "_prime_hidden_state_last_sweep", 0.0))
+        if now - last < interval:
+            return
+        self._prime_hidden_state_last_sweep = now
+        ttl = float(os.environ.get("PRIME_RL_HIDDEN_STATE_TTL_SECONDS", "21600"))
+        sweep_tensor_files(directory, ttl)
+
+    def pop_hidden_state_capture(self, request_id: str, output_path: str | None = None) -> dict[str, Any] | None:
         capture = self._prime_hidden_capture_state().pop(request_id, None)
         if capture is None:
             return None
@@ -141,8 +156,7 @@ class HiddenStateScoringMixin:
         if not chunks:
             seen_req_ids = sorted(str(req_id) for req_id in capture.get("seen_req_ids", []))
             raise RuntimeError(
-                f"no hidden-state chunks captured for request {request_id!r}; "
-                f"seen_model_runner_req_ids={seen_req_ids}"
+                f"no hidden-state chunks captured for request {request_id!r}; seen_model_runner_req_ids={seen_req_ids}"
             )
 
         ordered: list[torch.Tensor] = []
@@ -159,6 +173,18 @@ class HiddenStateScoringMixin:
                 f"hidden-state capture for {request_id!r} incomplete: captured {expected} / {target_len} rows"
             )
 
+        if output_path is not None:
+            ref = write_tensor_chunks_file(output_path, ordered)
+            self._prime_maybe_sweep_hidden_files(Path(output_path).parent)
+            return {
+                "transport": "filesystem",
+                "path": ref.path,
+                "dtype": ref.dtype,
+                "shape": ref.shape,
+                "offset": ref.offset,
+                "nbytes": ref.nbytes,
+            }
+
         hidden_cpu = torch.cat(ordered, dim=0) if len(ordered) > 1 else ordered[0]
         raw = hidden_cpu.view(torch.uint8).numpy().tobytes()
         return {
@@ -168,7 +194,7 @@ class HiddenStateScoringMixin:
         }
 
     @torch.no_grad()
-    def prefill_hidden_states(self, token_ids: list[int], dtype: str = "float16") -> dict[str, Any]:
+    def prefill_hidden_states(self, token_ids: list[int], dtype: str = "bfloat16") -> dict[str, Any]:
         """Legacy direct forward path.
 
         Kept for older non-DeepSeek backends, but the API route now drives

@@ -16,6 +16,7 @@ from prime_rl.transport import (
     TransportConfig,
     setup_micro_batch_receiver,
 )
+from prime_rl.transport.hidden_state_files import materialize_tensor_files
 
 
 class TensorMicroBatch(TypedDict):
@@ -226,6 +227,8 @@ class DataLoader:
             micro_batch.lora_num_tokens = [0] * self.multi_run_manager.max_runs
             micro_batch.lora_num_tokens[0] = len(micro_batch.input_ids)
         ref_hidden_states = None
+        if micro_batch.ref_hidden_states is not None and micro_batch.ref_hidden_state_files is not None:
+            raise ValueError("microbatch cannot carry both inline and filesystem ref hidden states")
         if micro_batch.ref_hidden_states is not None:
             ref_hidden_states = (
                 torch.frombuffer(
@@ -235,6 +238,11 @@ class DataLoader:
                 .reshape(micro_batch.ref_hidden_states.shape)
                 .unsqueeze(0)
             )
+        elif micro_batch.ref_hidden_state_files is not None:
+            ref_hidden_states = materialize_tensor_files(
+                micro_batch.ref_hidden_state_files,
+                expected_rows=len(micro_batch.input_ids),
+            ).unsqueeze(0)
         mm_kwargs: dict[str, Tensor] | None = None
         if micro_batch.mm_kwargs:
             # Each value is an EncodedTensor (dtype, shape, raw bytes).

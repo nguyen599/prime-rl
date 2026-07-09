@@ -33,6 +33,7 @@ count; per-token component weights ship on the wire and the trainer just
 executes them.
 """
 
+from pathlib import Path
 from typing import Annotated, Any, ClassVar, Literal, TypeAlias
 
 from pydantic import Field, model_validator
@@ -252,9 +253,21 @@ class OPDAlgoConfig(BaseAlgoConfig):
     the teacher LM head.
     """
 
-    teacher_hidden_dtype: Literal["float16", "bfloat16", "float32"] = "float16"
+    teacher_hidden_dtype: Literal["float16", "bfloat16", "float32"] = "bfloat16"
     """dtype requested from the teacher hidden-state scorer when
     ``distill_mode='full_vocab_hidden'``."""
+
+    teacher_hidden_transport: Literal["inline", "filesystem"] = "inline"
+    """Transport for full-vocab teacher hidden states.
+
+    ``inline`` preserves the legacy base64/bytes path. ``filesystem`` asks the
+    teacher worker to atomically write into ``teacher_hidden_path`` and moves
+    only file references through the orchestrator and packer.
+    """
+
+    teacher_hidden_path: Path | None = None
+    """Shared directory visible at the same absolute path from the teacher,
+    orchestrator, packer, and trainer. Required for filesystem transport."""
 
     teacher: FrozenModelConfig
     """The teacher — an inline frozen hosted model (``name`` + ``base_url``)
@@ -262,6 +275,17 @@ class OPDAlgoConfig(BaseAlgoConfig):
     frozen endpoint: scoring the policy under itself yields zero KL signal, so
     ``"policy"`` is not even representable here (use ``opsd`` for
     demo-conditioned self-teaching)."""
+
+    @model_validator(mode="after")
+    def validate_hidden_transport(self):
+        if self.teacher_hidden_transport == "filesystem":
+            if self.distill_mode != "full_vocab_hidden":
+                raise ValueError("teacher_hidden_transport='filesystem' requires distill_mode='full_vocab_hidden'")
+            if self.teacher_hidden_path is None:
+                raise ValueError("teacher_hidden_path is required for filesystem hidden-state transport")
+            if not self.teacher_hidden_path.is_absolute():
+                raise ValueError("teacher_hidden_path must be an absolute shared-filesystem path")
+        return self
 
 
 class OPSDAlgoConfig(BaseAlgoConfig):

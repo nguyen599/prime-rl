@@ -183,6 +183,14 @@ class MultiPacker(BasePacker):
                 "Run wrote a sample with ref hidden states length != sample length "
                 f"({sample.ref_hidden_states.shape[0]} != {sample_length})",
             )
+        if sample.ref_hidden_states is not None and sample.ref_hidden_states_file is not None:
+            return False, "Run wrote a sample with both inline and filesystem ref hidden states"
+        if sample.ref_hidden_states_file is not None and sample.ref_hidden_states_file.shape[0] != sample_length:
+            return (
+                False,
+                "Run wrote a sample with filesystem ref hidden states length != sample length "
+                f"({sample.ref_hidden_states_file.shape[0]} != {sample_length})",
+            )
         return True, None
 
     def _get_batch(self) -> None:

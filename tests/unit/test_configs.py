@@ -7,6 +7,7 @@ import tomli_w
 from pydantic import BaseModel, Field, ValidationError
 from pydantic_config import ConfigFileError
 
+from prime_rl.configs.algorithm import OPDAlgoConfig
 from prime_rl.configs.inference import InferenceConfig
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.configs.rl import RLConfig
@@ -165,6 +166,23 @@ def test_cli_overrides_toml(tmp_path):
 def test_removed_fused_lm_head_chunk_size_field_is_rejected():
     with pytest.raises(ValidationError, match="fused_lm_head_chunk_size"):
         TrainerModelConfig.model_validate({"fused_lm_head_chunk_size": "auto"})
+
+
+def test_opd_filesystem_hidden_transport_requires_absolute_shared_path():
+    base = {
+        "type": "opd",
+        "distill_mode": "full_vocab_hidden",
+        "teacher_hidden_transport": "filesystem",
+        "teacher": {"name": "teacher", "base_url": ["http://teacher:8001/v1"]},
+    }
+    with pytest.raises(ValidationError, match="teacher_hidden_path is required"):
+        OPDAlgoConfig.model_validate(base)
+    with pytest.raises(ValidationError, match="must be an absolute"):
+        OPDAlgoConfig.model_validate({**base, "teacher_hidden_path": "relative/path"})
+
+    config = OPDAlgoConfig.model_validate({**base, "teacher_hidden_path": "/shared/hidden"})
+    assert config.teacher_hidden_dtype == "bfloat16"
+    assert config.teacher_hidden_path == Path("/shared/hidden")
 
 
 def test_env_algo_overrides_top_level():

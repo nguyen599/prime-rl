@@ -12,6 +12,7 @@ from prime_rl.transport.types import (
     EncodedTensor,
     MicroBatch,
     RoutedExperts,
+    TensorFileReference,
     TrainingBatch,
     TrainingSample,
 )
@@ -74,6 +75,7 @@ __all__ = [
     "TrainingBatch",
     "MicroBatch",
     "EncodedTensor",
+    "TensorFileReference",
     "RoutedExperts",
     "setup_training_batch_sender",
     "setup_training_batch_receiver",

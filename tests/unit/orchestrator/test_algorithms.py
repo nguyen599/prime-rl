@@ -1,5 +1,6 @@
 import asyncio
-from unittest.mock import MagicMock
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pydantic
 import pytest
@@ -8,10 +9,11 @@ from verifiers.v1.graph import MessageNode
 from verifiers.v1.types import AssistantMessage, ToolMessage, UserMessage
 
 from prime_rl.configs.algorithm import AlgoConfig, FrozenModelConfig
-from prime_rl.orchestrator.algo import EchoAlgorithm, stamp_advantages, stamp_loss_routing
+from prime_rl.orchestrator.algo import EchoAlgorithm, OPDAlgorithm, stamp_advantages, stamp_loss_routing
 from prime_rl.orchestrator.trajectories import trace_to_samples
 from prime_rl.orchestrator.types import Rollout
-from prime_rl.transport.types import TrainingSample
+from prime_rl.transport.types import TensorFileReference, TrainingSample
+from prime_rl.utils.client import StaticInferencePool
 
 FROZEN = {"name": "org/ref-model", "base_url": ["http://ref:8001/v1"]}
 
@@ -76,6 +78,40 @@ def test_opd_teacher_must_be_a_frozen_endpoint():
         _build(type="opd")
     with pytest.raises(ValueError, match="FrozenModelConfig"):
         _build(type="opd", teacher="policy")
+
+
+def test_opd_filesystem_hidden_transport_keeps_payload_out_of_sample():
+    config = _build(
+        type="opd",
+        teacher=FROZEN,
+        distill_mode="full_vocab_hidden",
+        teacher_hidden_transport="filesystem",
+        teacher_hidden_path="/shared/hidden",
+    )
+    algo = OPDAlgorithm(config, MagicMock())
+    pool = MagicMock(spec=StaticInferencePool)
+    ref = TensorFileReference(
+        path="/shared/hidden/sample.prlhs",
+        dtype="bfloat16",
+        shape=[6, 4096],
+        offset=64,
+        nbytes=6 * 4096 * 2,
+    )
+    pool.score_hidden_states = AsyncMock(return_value=ref)
+    algo.teacher_pool = pool
+    rollout = _make_rollout([_make_sample()])
+
+    asyncio.run(algo.score_rollout(rollout))
+
+    sample = rollout.samples[0]
+    assert sample.ref_hidden_states is None
+    assert sample.ref_hidden_states_file == ref
+    assert sample.ref_logprobs is None
+    pool.score_hidden_states.assert_awaited_once_with(
+        sample.token_ids,
+        dtype="bfloat16",
+        storage_dir=Path("/shared/hidden"),
+    )
 
 
 def test_sft_requires_teacher():

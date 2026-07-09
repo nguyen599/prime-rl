@@ -5,7 +5,8 @@ from dataclasses import dataclass
 import numpy as np
 
 from prime_rl.trainer.utils import balanced_partition
-from prime_rl.transport.types import EncodedTensor, MicroBatch, RoutedExperts, TrainingSample
+from prime_rl.transport.hidden_state_files import copy_tensor_file_reference, slice_tensor_file_rows
+from prime_rl.transport.types import EncodedTensor, MicroBatch, RoutedExperts, TensorFileReference, TrainingSample
 
 ROUTED_EXPERTS_DTYPE_ITEMSIZE = {
     "uint8": 1,
@@ -17,6 +18,11 @@ ROUTED_EXPERTS_DTYPE_ITEMSIZE = {
 # carry it: absent rl means weight 1.0 on the loss mask, absent ce/ref_kl
 # means no component (weight 0.0).
 STREAM_FILL = {"rl_weights": 1.0, "ce_weights": 0.0, "ref_kl_weights": 0.0}
+
+
+def _encoded_itemsize(dtype: str) -> int:
+    # NumPy does not expose bfloat16 consistently across supported versions.
+    return 2 if str(dtype).removeprefix("torch.") == "bfloat16" else np.dtype(dtype).itemsize
 
 
 def _copy_routed_experts(routed_experts: RoutedExperts) -> RoutedExperts:
@@ -51,7 +57,7 @@ def _pad_routed_experts(micro_batch: MicroBatch, padding_size: int) -> None:
 def _slice_encoded(tensor: EncodedTensor, n_rows: int) -> EncodedTensor:
     """First `n_rows` rows of a dim-0-stacked encoded tensor (e.g. pixel_values, image_grid_thw)."""
     row = int(np.prod(tensor.shape[1:])) if len(tensor.shape) > 1 else 1
-    itemsize = np.dtype(tensor.dtype).itemsize
+    itemsize = _encoded_itemsize(tensor.dtype)
     return EncodedTensor(
         dtype=tensor.dtype,
         shape=[n_rows, *tensor.shape[1:]],
@@ -65,7 +71,7 @@ def _copy_encoded(tensor: EncodedTensor) -> EncodedTensor:
 
 def _encoded_zero_rows(template: EncodedTensor, n_rows: int) -> bytes:
     row = int(np.prod(template.shape[1:])) if len(template.shape) > 1 else 1
-    itemsize = np.dtype(template.dtype).itemsize
+    itemsize = _encoded_itemsize(template.dtype)
     return b"\0" * (n_rows * row * itemsize)
 
 
@@ -147,10 +153,15 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     # computed via prefill in the orchestrator when the algorithm scores against a reference
     ref_logprobs = training_example.ref_logprobs
     ref_hidden_states = (
-        _copy_encoded(training_example.ref_hidden_states)
-        if training_example.ref_hidden_states is not None
+        _copy_encoded(training_example.ref_hidden_states) if training_example.ref_hidden_states is not None else None
+    )
+    ref_hidden_state_files = (
+        [copy_tensor_file_reference(training_example.ref_hidden_states_file)]
+        if training_example.ref_hidden_states_file is not None
         else None
     )
+    if ref_hidden_states is not None and ref_hidden_state_files is not None:
+        raise ValueError("a training sample cannot carry both inline and filesystem hidden states")
     routed_experts = (
         _copy_routed_experts(training_example.routed_experts) if training_example.routed_experts is not None else None
     )
@@ -171,6 +182,8 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
             ref_logprobs = ref_logprobs[:cut]
         if ref_hidden_states is not None:
             ref_hidden_states = _slice_encoded(ref_hidden_states, cut)
+        if ref_hidden_state_files is not None:
+            ref_hidden_state_files = [slice_tensor_file_rows(ref_hidden_state_files[0], cut)]
         if rl_weights is not None:
             rl_weights = rl_weights[:cut]
         if ce_weights is not None:
@@ -198,6 +211,10 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     if ref_hidden_states is not None:
         assert ref_hidden_states.shape[0] == len(input_ids), (
             f"ref_hidden_states: {ref_hidden_states.shape}, input_ids: {len(input_ids)}"
+        )
+    if ref_hidden_state_files is not None:
+        assert sum(int(ref.shape[0]) for ref in ref_hidden_state_files) == len(input_ids), (
+            f"ref_hidden_state_files: {[ref.shape for ref in ref_hidden_state_files]}, input_ids: {len(input_ids)}"
         )
     for stream_name, stream in (
         ("rl_weights", rl_weights),
@@ -228,6 +245,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         sequence_lengths=[len(input_ids)],
         ref_logprobs=ref_logprobs,
         ref_hidden_states=ref_hidden_states,
+        ref_hidden_state_files=ref_hidden_state_files,
         temperatures=temperatures,
         routed_experts=routed_experts,
         mm_token_type_ids=mm_token_type_ids,
@@ -267,6 +285,7 @@ class _MicroBatchBin:
             and not _is_multimodal_sample(sample)
             and self.length + len(sample.input_ids) <= max_seq_len
             and (first_sample.routed_experts is None) == (sample.routed_experts is None)
+            and (first_sample.ref_hidden_state_files is None) == (sample.ref_hidden_state_files is None)
         )
 
     def add(self, lora_idx: int, sample: MicroBatch) -> None:
@@ -303,6 +322,13 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
         None,
     )
     has_ref_hidden_states = ref_hidden_template is not None
+    ref_hidden_file_template = next(
+        (ref for _, sample in bin_content.samples for ref in (sample.ref_hidden_state_files or [])),
+        None,
+    )
+    has_ref_hidden_state_files = ref_hidden_file_template is not None
+    if has_ref_hidden_states and has_ref_hidden_state_files:
+        raise ValueError("cannot pack inline and filesystem hidden states into the same microbatch")
     has_mm_token_type_ids = any(sample.mm_token_type_ids is not None for _, sample in bin_content.samples)
     # A weight stream materializes as soon as one packed sample carries it; the
     # samples that lack it get the stream's identity fill (STREAM_FILL).
@@ -317,6 +343,7 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
     env_names: list[str] = []
     ref_logprobs: list[float] | None = [] if has_ref_logprobs else None
     ref_hidden_data = bytearray() if has_ref_hidden_states else None
+    ref_hidden_state_files: list[TensorFileReference] | None = [] if has_ref_hidden_state_files else None
     mm_token_type_ids: list[int] | None = [] if has_mm_token_type_ids else None
     streams: dict[str, list[float] | None] = {name: ([] if has_stream[name] else None) for name in STREAM_FILL}
     routed_experts: RoutedExperts | None = None
@@ -348,6 +375,27 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
                 ref_hidden_data += sample_ref_hidden.data
             else:
                 ref_hidden_data += _encoded_zero_rows(ref_hidden_template, sample_len)
+        if ref_hidden_state_files is not None:
+            sample_refs = sample.ref_hidden_state_files
+            if not sample_refs:
+                raise ValueError("filesystem hidden-state packing cannot backfill a sample without a file reference")
+            sample_rows = 0
+            for ref in sample_refs:
+                if ref.dtype != ref_hidden_file_template.dtype:
+                    raise ValueError(
+                        f"packed filesystem hidden-state dtype mismatch: {ref.dtype} != {ref_hidden_file_template.dtype}"
+                    )
+                if ref.shape[1:] != ref_hidden_file_template.shape[1:]:
+                    raise ValueError(
+                        "packed filesystem hidden-state shape mismatch: "
+                        f"{ref.shape[1:]} != {ref_hidden_file_template.shape[1:]}"
+                    )
+                ref_hidden_state_files.append(copy_tensor_file_reference(ref))
+                sample_rows += int(ref.shape[0])
+            if sample_rows != sample_len:
+                raise ValueError(
+                    f"filesystem hidden-state rows {sample_rows} do not match packed sample length {sample_len}"
+                )
         for name, fill in STREAM_FILL.items():
             stream = streams[name]
             if stream is not None:
@@ -387,6 +435,7 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
         sequence_lengths=sequence_lengths,
         ref_logprobs=ref_logprobs,
         ref_hidden_states=ref_hidden_states,
+        ref_hidden_state_files=ref_hidden_state_files,
         temperatures=temperatures,
         lora_num_tokens=lora_num_tokens,
         routed_experts=routed_experts,
@@ -559,6 +608,11 @@ def _assert_token_arrays_aligned(micro_batch: MicroBatch) -> None:
         assert micro_batch.ref_hidden_states.shape[0] == num_tokens, (
             f"ref_hidden_states misaligned after packing: "
             f"{micro_batch.ref_hidden_states.shape[0]} != {num_tokens} tokens"
+        )
+    if micro_batch.ref_hidden_state_files is not None:
+        file_rows = sum(int(ref.shape[0]) for ref in micro_batch.ref_hidden_state_files)
+        assert file_rows <= num_tokens, (
+            f"filesystem ref_hidden_states misaligned after packing: {file_rows} > {num_tokens} tokens"
         )
 
 

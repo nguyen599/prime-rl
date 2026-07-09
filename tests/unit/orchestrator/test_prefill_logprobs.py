@@ -3,7 +3,8 @@ import json
 
 import httpx
 
-from prime_rl.utils.client import prefill_logprobs
+from prime_rl.transport.types import EncodedTensor, TensorFileReference
+from prime_rl.utils.client import prefill_hidden_states, prefill_logprobs
 
 
 class _FakeOpenAIClient:
@@ -58,5 +59,60 @@ def test_prefill_logprobs_uses_inference_generate():
                 },
             }
         ]
+
+    asyncio.run(_run())
+
+
+def test_prefill_hidden_states_filesystem_returns_handle_without_decoding_payload(tmp_path):
+    async def _run():
+        output = tmp_path / "teacher" / "result.prlhs"
+        fake_openai = _FakeOpenAIClient(
+            {
+                "transport": "filesystem",
+                "path": str(output),
+                "dtype": "bfloat16",
+                "shape": [3, 4096],
+                "offset": 64,
+                "nbytes": 3 * 4096 * 2,
+            }
+        )
+        result = await prefill_hidden_states(
+            fake_openai,
+            "teacher",
+            [1, 2, 3],
+            storage_dir=tmp_path / "teacher",
+        )
+
+        assert isinstance(result, TensorFileReference)
+        assert result.dtype == "bfloat16"
+        call = fake_openai.calls[0]
+        assert call["url"] == "http://fake-host:8000/prime_rl/prefill_hidden_states"
+        assert call["body"]["transport"] == "filesystem"
+        assert call["body"]["dtype"] == "bfloat16"
+        assert call["body"]["output_path"].startswith(str(tmp_path / "teacher"))
+        assert call["body"]["output_path"].endswith(".prlhs")
+
+    asyncio.run(_run())
+
+
+def test_prefill_hidden_states_inline_remains_backward_compatible():
+    async def _run():
+        fake_openai = _FakeOpenAIClient(
+            {
+                "dtype": "bfloat16",
+                "shape": [1, 2],
+                "data": "AAAAAA==",
+            }
+        )
+        result = await prefill_hidden_states(fake_openai, "teacher", [1])
+
+        assert isinstance(result, EncodedTensor)
+        assert result.dtype == "bfloat16"
+        assert result.shape == [1, 2]
+        assert fake_openai.calls[0]["body"] == {
+            "model": "teacher",
+            "token_ids": [1],
+            "dtype": "bfloat16",
+        }
 
     asyncio.run(_run())

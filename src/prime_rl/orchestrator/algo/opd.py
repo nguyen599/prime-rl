@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from prime_rl.configs.algorithm import OPDAlgoConfig
 from prime_rl.orchestrator.algo.base import Algorithm
+from prime_rl.transport import EncodedTensor, TensorFileReference
 from prime_rl.utils.client import StaticInferencePool
 
 if TYPE_CHECKING:
@@ -45,9 +46,24 @@ class OPDAlgorithm(Algorithm):
         async def score_sample(sample: TrainingSample) -> None:
             token_ids = list(sample.token_ids)
             if self.opd_config.distill_mode == "full_vocab_hidden":
-                sample.ref_hidden_states = await pool.score_hidden_states(
-                    token_ids, dtype=self.opd_config.teacher_hidden_dtype
+                storage_dir = (
+                    self.opd_config.teacher_hidden_path
+                    if self.opd_config.teacher_hidden_transport == "filesystem"
+                    else None
                 )
+                hidden = await pool.score_hidden_states(
+                    token_ids,
+                    dtype=self.opd_config.teacher_hidden_dtype,
+                    storage_dir=storage_dir,
+                )
+                if isinstance(hidden, TensorFileReference):
+                    sample.ref_hidden_states_file = hidden
+                    sample.ref_hidden_states = None
+                elif isinstance(hidden, EncodedTensor):
+                    sample.ref_hidden_states = hidden
+                    sample.ref_hidden_states_file = None
+                else:
+                    raise TypeError(f"unexpected teacher hidden-state payload: {type(hidden)!r}")
                 sample.ref_logprobs = None
             else:
                 sample.ref_logprobs = await pool.score(token_ids)

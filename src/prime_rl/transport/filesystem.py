@@ -1,9 +1,12 @@
 import asyncio
+import errno
+import os
 from pathlib import Path
 from time import time
 
 from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.transport.base import MicroBatchReceiver, MicroBatchSender, TrainingBatchReceiver, TrainingBatchSender
+from prime_rl.transport.hidden_state_files import copy_tensor_file_reference
 from prime_rl.transport.types import MicroBatch, TrainingBatch
 from prime_rl.utils.pathing import get_rollout_dir, get_step_path, sync_wait_for_path
 
@@ -135,13 +138,72 @@ class FileSystemMicroBatchSender(MicroBatchSender):
         step_path = get_step_path(self.rollout_dir, self.current_step)
         step_path.mkdir(parents=True, exist_ok=True)
 
+        linked_sources: set[Path] = set()
+        unowned_sources: set[Path] = set()
+
         for data_rank in range(self.data_world_size):
+            rank_linked, rank_unowned = self._assign_hidden_state_links(
+                micro_batch_grid[data_rank], step_path, data_rank
+            )
+            linked_sources.update(rank_linked)
+            unowned_sources.update(rank_unowned)
             buffer = self.encoder.encode(micro_batch_grid[data_rank])
             tmp_path = step_path / f"rank_{data_rank}.bin.tmp"
             with open(tmp_path, "wb") as f:
                 f.write(buffer)
             tmp_path.rename(step_path / f"rank_{data_rank}.bin")
+
+        # Every consumer now owns a private hard link. Removing the producer
+        # name keeps disk usage bounded while allowing each rank to unlink its
+        # link immediately after mmap. Sources that could not be hard-linked
+        # stay in place and are handled by the producer TTL sweep.
+        for source in linked_sources - unowned_sources:
+            try:
+                source.unlink(missing_ok=True)
+            except OSError:
+                pass
         self.current_step += 1
+
+    def _assign_hidden_state_links(
+        self, micro_batches: list[MicroBatch], step_path: Path, data_rank: int
+    ) -> tuple[set[Path], set[Path]]:
+        link_dir = step_path / "hidden_state_refs" / f"rank_{data_rank}"
+        linked_sources: set[Path] = set()
+        unowned_sources: set[Path] = set()
+        link_count = 0
+
+        for micro_batch_idx, micro_batch in enumerate(micro_batches):
+            refs = micro_batch.ref_hidden_state_files
+            if refs is None:
+                continue
+            link_dir.mkdir(parents=True, exist_ok=True)
+            private_refs = []
+            for ref_idx, ref in enumerate(refs):
+                source = Path(ref.path)
+                target = link_dir / f"mb{micro_batch_idx:04d}_ref{ref_idx:04d}_{source.name}"
+                target.unlink(missing_ok=True)
+                try:
+                    os.link(source, target)
+                except OSError as exc:
+                    if exc.errno not in {errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP}:
+                        raise
+                    # Cross-filesystem or unsupported hard links remain valid,
+                    # but the trainer must not unlink the shared producer path.
+                    private_refs.append(copy_tensor_file_reference(ref, unlink_after_read=False))
+                    unowned_sources.add(source)
+                else:
+                    private_ref = copy_tensor_file_reference(ref, unlink_after_read=True)
+                    private_ref.path = str(target)
+                    private_refs.append(private_ref)
+                    linked_sources.add(source)
+                    link_count += 1
+            micro_batch.ref_hidden_state_files = private_refs
+
+        if link_count:
+            self.logger.debug(
+                f"Assigned {link_count} filesystem hidden-state segment(s) to trainer data rank {data_rank}"
+            )
+        return linked_sources, unowned_sources
 
 
 class FileSystemMicroBatchReceiver(MicroBatchReceiver):
