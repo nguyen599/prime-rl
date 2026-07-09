@@ -246,7 +246,13 @@ class DFlashOlmo3SinkDecoderLayer(nn.Module):
         return hidden_states
 
 
-@support_torch_compile
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "input_embeds": 0,
+    }
+)
 class DFlashOlmo3SinkModel(nn.Module):
     def __init__(
         self,
