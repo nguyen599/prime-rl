@@ -382,21 +382,56 @@ def train(config: TrainerConfig):
         local_rl_scale = 0
         local_ce_scale = 0
         local_ref_kl_scale = 0
+        local_padded_tokens = 0
+        local_nonpad_tokens = 0
+        local_loss_tokens = 0
         for micro_batch in micro_batches:
+            local_padded_tokens += int(micro_batch["input_ids"].numel())
+            local_nonpad_tokens += sum(1 for env_name in micro_batch.get("env_names", []) if env_name)
             mask = micro_batch["loss_mask"]
+            local_loss_tokens += int(mask.sum())
             rl_w = micro_batch["rl_weights"]
             local_rl_scale += int((mask & (rl_w != 0)).sum()) if rl_w is not None else int(mask.sum())
             if micro_batch["ce_weights"] is not None:
                 local_ce_scale += int((micro_batch["ce_weights"] != 0).sum())
             if micro_batch["ref_kl_weights"] is not None:
                 local_ref_kl_scale += int((micro_batch["ref_kl_weights"] != 0).sum())
-        global_scales = torch.tensor(
-            [local_rl_scale, local_ce_scale, local_ref_kl_scale], dtype=torch.int64, device="cuda"
-        )
         dp_cp_group = parallel_dims.get_mesh("dp_cp").get_group()
-        dist.all_reduce(global_scales, op=dist.ReduceOp.SUM, group=dp_cp_group)
-        rl_scale, ce_scale, ref_kl_scale = (max(scale, 1) for scale in global_scales.tolist())
+        global_batch_stats = torch.tensor(
+            [
+                local_padded_tokens,
+                local_nonpad_tokens,
+                local_loss_tokens,
+                local_rl_scale,
+                local_ce_scale,
+                local_ref_kl_scale,
+            ],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        dist.all_reduce(global_batch_stats, op=dist.ReduceOp.SUM, group=dp_cp_group)
+        (
+            global_padded_tokens,
+            global_nonpad_tokens,
+            global_loss_tokens,
+            global_rl_scale,
+            global_ce_scale,
+            global_ref_kl_scale,
+        ) = global_batch_stats.tolist()
+        rl_scale, ce_scale, ref_kl_scale = (
+            max(global_rl_scale, 1),
+            max(global_ce_scale, 1),
+            max(global_ref_kl_scale, 1),
+        )
 
+        logger.info(
+            "Optimizer step token batch: "
+            f"micro_batches={batch_size} seq_len={seq_len} "
+            f"local_padded_tokens={local_padded_tokens:,} global_padded_tokens={global_padded_tokens:,} "
+            f"local_nonpad_tokens={local_nonpad_tokens:,} global_nonpad_tokens={global_nonpad_tokens:,} "
+            f"local_loss_tokens={local_loss_tokens:,} global_loss_tokens={global_loss_tokens:,} "
+            f"global_component_tokens[rl={global_rl_scale:,},ce={global_ce_scale:,},ref_kl={global_ref_kl_scale:,}]"
+        )
         logger.debug(f"Starting forward and backward pass ({batch_size=})")
         tensors = Tensors()  # Used to accumulate tensor statistics across micro-batches and ranks for logging
         cp_enabled = parallel_dims.cp_enabled
@@ -801,6 +836,16 @@ def train(config: TrainerConfig):
             "perf/throughput_per_gpu": throughput / world.world_size,
             "perf/mfu": mfu,
             "perf/peak_memory": peak_memory,
+            "perf/packed_micro_batches": batch_size,
+            "perf/local_padded_tokens": local_padded_tokens,
+            "perf/global_padded_tokens": global_padded_tokens,
+            "perf/local_nonpad_tokens": local_nonpad_tokens,
+            "perf/global_nonpad_tokens": global_nonpad_tokens,
+            "perf/local_loss_tokens": local_loss_tokens,
+            "perf/global_loss_tokens": global_loss_tokens,
+            "perf/global_rl_tokens": global_rl_scale,
+            "perf/global_ce_tokens": global_ce_scale,
+            "perf/global_ref_kl_tokens": global_ref_kl_scale,
             "step": progress.step,
         }
         monitor.log(perf_metrics, step=progress.step)
