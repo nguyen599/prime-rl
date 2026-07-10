@@ -27,6 +27,71 @@ def apply_shared_vllm_patches():
     monkey_patch_kv_xfer_finished_tolerate_freed()
     register_olmo3_sink_model()
     monkey_patch_skip_deepseek_v4_sparse_mla_warmup()
+    monkey_patch_multiproc_dp_worker_ports()
+
+
+def _deterministic_dp_worker_port_start(parallel_config) -> int | None:
+    if int(getattr(parallel_config, "data_parallel_size", 1)) <= 1:
+        return None
+    rpc_port = getattr(parallel_config, "data_parallel_rpc_port", None)
+    dp_index = getattr(parallel_config, "data_parallel_index", None)
+    if rpc_port is None or dp_index is None:
+        return None
+    start = int(rpc_port) + 1000 + int(dp_index) * 64
+    if not 1024 <= start <= 65471:
+        raise ValueError(
+            f"deterministic DP worker port range [{start}, {start + 63}] is outside the valid TCP port range"
+        )
+    return start
+
+
+def monkey_patch_multiproc_dp_worker_ports() -> None:
+    """Give each local vLLM DP engine a disjoint worker rendezvous range.
+
+    Upstream ``MultiprocExecutor`` asks the kernel for an ephemeral port and
+    closes the probe socket before its worker binds. Concurrent DP engines can
+    therefore choose the same port and one fails with ``EADDRINUSE``. This
+    patch is opt-in because it changes vLLM networking only for deployments
+    that explicitly enable it.
+    """
+    if os.environ.get("PRIME_RL_DETERMINISTIC_DP_WORKER_PORTS", "0") != "1":
+        return
+
+    try:
+        from vllm.utils.network_utils import _get_open_port
+        from vllm.v1.executor import multiproc_executor
+    except Exception as exc:
+        logger.warning("Could not install deterministic vLLM DP worker port patch: %s", exc)
+        return
+
+    original = multiproc_executor.MultiprocExecutor._init_executor
+    if getattr(original, "_prime_rl_deterministic_dp_ports", False):
+        return
+
+    def _init_executor(self):
+        start = _deterministic_dp_worker_port_start(self.parallel_config)
+        if start is None:
+            return original(self)
+
+        original_get_open_port = multiproc_executor.get_open_port
+
+        def _rank_local_open_port() -> int:
+            return _get_open_port(start_port=start, max_attempts=64)
+
+        multiproc_executor.get_open_port = _rank_local_open_port
+        try:
+            logger.info(
+                "Using deterministic vLLM DP worker port range [%d, %d] for data_parallel_index=%s",
+                start,
+                start + 63,
+                self.parallel_config.data_parallel_index,
+            )
+            return original(self)
+        finally:
+            multiproc_executor.get_open_port = original_get_open_port
+
+    _init_executor._prime_rl_deterministic_dp_ports = True
+    multiproc_executor.MultiprocExecutor._init_executor = _init_executor
 
 
 def monkey_patch_skip_deepseek_v4_sparse_mla_warmup():
