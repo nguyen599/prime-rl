@@ -12,7 +12,7 @@ from typing import Protocol, runtime_checkable
 import httpx
 import verifiers.v1 as vf
 from httpx import AsyncClient
-from openai import AsyncOpenAI, NotFoundError
+from openai import APIConnectionError, APITimeoutError, AsyncOpenAI, NotFoundError
 from renderers import RendererConfig
 from tenacity import AsyncRetrying, retry, retry_if_exception, stop_after_attempt, stop_after_delay, wait_exponential
 from verifiers.v1.clients.config import EvalClientConfig, TrainClientConfig
@@ -118,7 +118,39 @@ class PrefillScorer:
     ) -> EncodedTensor | TensorFileReference:
         openai = self._get_openai(configs)
         async with self._hidden_semaphore:
-            return await prefill_hidden_states(openai, model, token_ids, dtype=dtype, storage_dir=storage_dir)
+            retry_timeout = float(os.environ.get("PRIME_RL_PREFILL_HIDDEN_RETRY_TIMEOUT_SECONDS", "900"))
+            if retry_timeout <= 0:
+                return await prefill_hidden_states(openai, model, token_ids, dtype=dtype, storage_dir=storage_dir)
+
+            retryable_errors = (APIConnectionError, APITimeoutError)
+            retry_min = max(0.0, float(os.environ.get("PRIME_RL_PREFILL_HIDDEN_RETRY_MIN_SECONDS", "2")))
+            retry_max = max(
+                retry_min,
+                float(os.environ.get("PRIME_RL_PREFILL_HIDDEN_RETRY_MAX_SECONDS", "30")),
+            )
+            async for attempt in AsyncRetrying(
+                retry=retry_if_exception(lambda exc: isinstance(exc, retryable_errors)),
+                wait=wait_exponential(multiplier=max(retry_min, 0.001), min=retry_min, max=retry_max),
+                stop=stop_after_delay(retry_timeout),
+                reraise=True,
+            ):
+                with attempt:
+                    try:
+                        return await prefill_hidden_states(
+                            openai,
+                            model,
+                            token_ids,
+                            dtype=dtype,
+                            storage_dir=storage_dir,
+                        )
+                    except retryable_errors as exc:
+                        get_logger().warning(
+                            "Teacher hidden-state endpoint unavailable; retrying "
+                            f"attempt={attempt.retry_state.attempt_number} timeout_s={retry_timeout:g}: {exc}"
+                        )
+                        raise
+
+            raise RuntimeError("teacher hidden-state retry loop exited without a result")
 
     def _get_openai(self, configs: list[vf.ClientConfig]) -> AsyncOpenAI:
         if not configs:

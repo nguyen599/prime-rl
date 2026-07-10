@@ -3,10 +3,12 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
+from openai import APIConnectionError
 from verifiers.v1.clients.config import EvalClientConfig
 
 from prime_rl.configs.shared import ClientConfig
-from prime_rl.utils.client import _is_retryable_lora_error, load_lora_adapter, setup_clients
+from prime_rl.transport.types import EncodedTensor
+from prime_rl.utils.client import PrefillScorer, _is_retryable_lora_error, load_lora_adapter, setup_clients
 
 
 def test_is_retryable_lora_error_returns_true_for_404():
@@ -108,3 +110,51 @@ def test_setup_clients_preserves_chat_client_defaults():
             headers={},
         )
     ]
+
+
+def test_prefill_hidden_states_retries_connection_errors(monkeypatch):
+    calls = 0
+
+    async def fake_prefill(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise APIConnectionError(request=httpx.Request("POST", "http://teacher/prime_rl/prefill_hidden_states"))
+        return EncodedTensor(dtype="bfloat16", shape=[1, 2], data=b"\0\0\0\0")
+
+    monkeypatch.setattr("prime_rl.utils.client.prefill_hidden_states", fake_prefill)
+    monkeypatch.setenv("PRIME_RL_PREFILL_HIDDEN_RETRY_TIMEOUT_SECONDS", "5")
+    monkeypatch.setenv("PRIME_RL_PREFILL_HIDDEN_RETRY_MIN_SECONDS", "0")
+    monkeypatch.setenv("PRIME_RL_PREFILL_HIDDEN_RETRY_MAX_SECONDS", "0")
+    scorer = PrefillScorer()
+    config = EvalClientConfig(api_key_var="PRIME_API_KEY", base_url="http://teacher/v1", headers={})
+
+    result = asyncio.run(scorer.score_hidden_states([config], "teacher", [1]))
+
+    assert result.shape == [1, 2]
+    assert calls == 2
+
+
+def test_prefill_hidden_states_does_not_retry_correctness_errors(monkeypatch):
+    calls = 0
+
+    async def fake_prefill(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("invalid hidden-state response")
+
+    monkeypatch.setattr("prime_rl.utils.client.prefill_hidden_states", fake_prefill)
+    monkeypatch.setenv("PRIME_RL_PREFILL_HIDDEN_RETRY_TIMEOUT_SECONDS", "5")
+    monkeypatch.setenv("PRIME_RL_PREFILL_HIDDEN_RETRY_MIN_SECONDS", "0")
+    monkeypatch.setenv("PRIME_RL_PREFILL_HIDDEN_RETRY_MAX_SECONDS", "0")
+    scorer = PrefillScorer()
+    config = EvalClientConfig(api_key_var="PRIME_API_KEY", base_url="http://teacher/v1", headers={})
+
+    try:
+        asyncio.run(scorer.score_hidden_states([config], "teacher", [1]))
+    except RuntimeError as exc:
+        assert str(exc) == "invalid hidden-state response"
+    else:
+        raise AssertionError("expected RuntimeError")
+
+    assert calls == 1
