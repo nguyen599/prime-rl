@@ -661,7 +661,11 @@ def train(config: TrainerConfig):
 
             # Add loss tensors to tensor dict for logging purposes
             for key, loss_tensor in loss_tensors.items():
-                tensors[key].append(loss_tensor.detach().to("cpu"))
+                # Tensors.compute_stats concatenates metric samples along dim 0.
+                # Most loss metrics are already vectors, but full-vocab OPD
+                # reports its mean KL as a scalar. Normalize both forms to a
+                # 1-D sample vector before accumulation.
+                tensors[key].append(loss_tensor.detach().to("cpu").reshape(-1))
 
             # Debug log with *local, micro step* stats
             micro_step_message = f"Micro Step {micro_step}/{len(micro_batches)} | Loss {tensors['loss'][-1].mean().item():.4f} | Entropy {tensors['entropy/all'][-1].mean().item():.4f}"
