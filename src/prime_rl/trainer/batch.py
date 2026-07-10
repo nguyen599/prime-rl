@@ -633,8 +633,10 @@ def _pad_group_for_distribution(group: list[MicroBatch], num_train_workers: int)
     """Pad a group of micro batches so its length is divisible by num_train_workers."""
     num_padding = -len(group) % num_train_workers
     if num_padding > 0 and len(group) > 0:
-        dummy = _make_dummy_batch(group[0])
-        group.extend([dummy] * num_padding)
+        # Each rank's filesystem sender rewrites file references to private
+        # hard-link paths. Reusing one dummy object across ranks makes those
+        # rewrites form a chain and sender cleanup removes earlier rank links.
+        group.extend(_make_dummy_batch(group[0]) for _ in range(num_padding))
     return group
 
 

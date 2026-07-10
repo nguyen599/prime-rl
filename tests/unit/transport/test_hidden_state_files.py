@@ -125,6 +125,42 @@ def test_private_links_survive_until_all_readers_materialize(tmp_path: Path):
     assert not private.exists()
 
 
+def test_distribution_padding_owns_independent_hidden_state_references(tmp_path: Path):
+    values = torch.arange(12, dtype=torch.bfloat16).reshape(4, 3)
+    ref = write_tensor_file(tmp_path / "source.prlhs", values)
+    grid = prepare_batch(
+        rollouts=[_sample([1, 2, 3, 4], ref)],
+        seq_len=8,
+        num_train_workers=8,
+        idxs=[0],
+        num_loras=1,
+        bin_cost=build_bin_cost(None),
+        pad_to_multiple_of=8,
+    )
+
+    assert all(len(rank_batches) == 1 for rank_batches in grid)
+    assert len({id(rank_batches[0]) for rank_batches in grid}) == 8
+
+    output_dir = tmp_path / "trainer_output"
+    FileSystemMicroBatchSender(output_dir, data_world_size=8).send(grid)
+    private_refs = []
+    for rank in range(8):
+        received = FileSystemMicroBatchReceiver(output_dir, data_rank=rank).receive()[0]
+        assert received.ref_hidden_state_files is not None
+        private_ref = received.ref_hidden_state_files[0]
+        private_refs.append(private_ref)
+        assert Path(private_ref.path).parent.name == f"rank_{rank}"
+        assert Path(private_ref.path).name.count("mb0000_ref0000_") == 1
+        assert Path(private_ref.path).exists()
+
+    assert len({ref.path for ref in private_refs}) == 8
+    for private_ref in private_refs:
+        restored = materialize_tensor_files([private_ref], expected_rows=8, unlink_owned=False)
+        torch.testing.assert_close(restored[:4], values)
+    unlink_owned_tensor_files(private_refs)
+    assert all(not Path(ref.path).exists() for ref in private_refs)
+
+
 def test_prepare_batch_truncates_file_reference_without_reading_payload(tmp_path: Path):
     values = torch.arange(30, dtype=torch.float32).reshape(10, 3)
     ref = write_tensor_file(tmp_path / "long.prlhs", values)
