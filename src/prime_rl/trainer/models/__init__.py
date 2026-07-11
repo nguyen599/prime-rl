@@ -10,6 +10,7 @@ from transformers.models.auto.auto_factory import _BaseAutoModelClass, _LazyAuto
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 from prime_rl.trainer.models.base import PreTrainedModelPrimeRL
 from prime_rl.trainer.models.layers.lm_head import PrimeLmOutput, cast_float_and_contiguous
@@ -38,6 +39,7 @@ def _optional_import(module_name: str, *symbols: str):
 
 (LlamaForCausalLM,) = _optional_import("prime_rl.trainer.models.llama", "LlamaForCausalLM")
 (Qwen3ForCausalLM,) = _optional_import("prime_rl.trainer.models.qwen3", "Qwen3ForCausalLM")
+(Qwen3_5ForCausalLM,) = _optional_import("prime_rl.trainer.models.qwen3_5", "Qwen3_5ForCausalLM")
 AfmoeConfig, AfmoeForCausalLM = _optional_import("prime_rl.trainer.models.afmoe", "AfmoeConfig", "AfmoeForCausalLM")
 Glm4MoeConfig, Glm4MoeForCausalLM = _optional_import(
     "prime_rl.trainer.models.glm4_moe", "Glm4MoeConfig", "Glm4MoeForCausalLM"
@@ -74,6 +76,7 @@ for _model_type, _config_cls in (
     ("minimax_m2", MiniMaxM2Config),
     ("nemotron_h", NemotronHConfig),
     ("qwen3_moe", Qwen3MoeConfig),
+    ("qwen3_5_text", Qwen3_5TextConfig),
     ("qwen3_5_moe_text", Qwen3_5MoeConfig),
 ):
     if _config_cls is not None:
@@ -91,6 +94,7 @@ for _config_cls, _model_cls in (
     (MiniMaxM2Config, MiniMaxM2ForCausalLM),
     (NemotronHConfig, NemotronHForCausalLM),
     (Qwen3MoeConfig, Qwen3MoeForCausalLM),
+    (Qwen3_5TextConfig, Qwen3_5ForCausalLM),
     (Qwen3_5MoeConfig, Qwen3_5MoeForCausalLM),
     (GptOssConfig, GptOssForCausalLM),
 ):
