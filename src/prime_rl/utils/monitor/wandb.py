@@ -116,6 +116,9 @@ def _task_record(rollout) -> dict[str, Any]:
     task = getattr(rollout, "task", None)
     if task is None:
         return {}
+    # Verifiers v1 wraps environment-specific fields in TraceTask.data. Keep
+    # accepting legacy traces where those fields lived directly on task.
+    task = getattr(task, "data", task)
     if hasattr(task, "model_dump"):
         try:
             record = task.model_dump(mode="json")
@@ -149,7 +152,7 @@ def _classify_proof_opd_stage(prompt: str) -> str:
     text = prompt.lower()
     if "candidate solution(s) to refine" in text or "provide a better solution" in text:
         return "refine"
-    if 'solution evaluation' in text and "assess whether" in text:
+    if "solution evaluation" in text and "assess whether" in text:
         return "meta"
     if "evaluate the quality of a solution" in text:
         return "verifier"
@@ -430,11 +433,9 @@ class WandbMonitor(Monitor):
         if not self.is_master:
             return
         has_proof_opd_traces = any(_proof_opd_trace(rollout) for rollout in rollouts)
-        force_proof_opd_trace_log = (
-            has_proof_opd_traces
-            and os.environ.get("PRIME_WANDB_LOG_PROOF_OPD_TRACES", "1").strip().lower()
-            not in {"0", "false", "no", "off"}
-        )
+        force_proof_opd_trace_log = has_proof_opd_traces and os.environ.get(
+            "PRIME_WANDB_LOG_PROOF_OPD_TRACES", "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
         if (
             not self.config
             or not isinstance(self.config, WandbWithExtrasConfig)
