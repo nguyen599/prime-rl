@@ -10,6 +10,12 @@ from torch.nn import Module
 
 from prime_rl.transport.hidden_state_files import sweep_tensor_files, write_tensor_chunks_file
 
+_CAPTURE_DTYPES = {
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+    "float32": torch.float32,
+}
+
 
 class HiddenStateScoringMixin:
     """Worker RPC for full-vocab OPD teacher hidden-state scoring.
@@ -20,6 +26,14 @@ class HiddenStateScoringMixin:
     """
 
     def _prime_hidden_capture_is_primary_worker(self) -> bool:
+        try:
+            from vllm.distributed import get_tp_group
+
+            return int(get_tp_group().rank_in_group) == 0
+        except (AssertionError, RuntimeError):
+            # Unit tests and older worker boot paths can call this before the
+            # vLLM tensor-parallel group has been initialized.
+            pass
         device = getattr(self, "device", None)
         device_index = getattr(device, "index", None)
         if device_index is not None:
@@ -38,6 +52,79 @@ class HiddenStateScoringMixin:
             state = {}
             setattr(self, "_prime_hidden_state_captures", state)
         return state
+
+    def _prime_hidden_capture_expected_width(self) -> int:
+        """Return the width consumed by the model's output projection."""
+        runner = self.model_runner
+        model = getattr(runner, "model", None)
+        if hasattr(model, "runnable"):
+            model = model.runnable
+
+        head_width = None
+        lm_head = getattr(model, "lm_head", None)
+        head_weight = getattr(lm_head, "weight", None)
+        head_shape = getattr(head_weight, "shape", None)
+        if head_shape is not None and len(head_shape) == 2:
+            head_width = int(head_shape[-1])
+
+        model_config = getattr(runner, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        config_width = getattr(hf_config, "hidden_size", None)
+        if config_width is not None:
+            config_width = int(config_width)
+
+        if head_width is not None and config_width is not None and head_width != config_width:
+            raise RuntimeError(
+                "hidden-state capture found inconsistent LM-head/config widths: "
+                f"lm_head={head_width}, config.hidden_size={config_width}"
+            )
+        expected_width = head_width if head_width is not None else config_width
+        if expected_width is None or expected_width <= 0:
+            raise RuntimeError("hidden-state capture could not determine the model LM-head input width")
+        return expected_width
+
+    @staticmethod
+    def _prime_hidden_capture_bindings(
+        captures: dict[str, dict[str, Any]], runner: Any, num_scheduled_tokens: Any
+    ) -> dict[str, dict[str, Any]]:
+        """Bind API capture IDs to model-runner IDs without guessing by order."""
+        req_ids = list(getattr(runner.input_batch, "req_ids", []))
+        bindings: dict[str, dict[str, Any]] = {}
+
+        for capture_id, capture in captures.items():
+            bound_req_id = capture.get("runner_req_id")
+            if bound_req_id is None and capture_id in req_ids:
+                bound_req_id = capture_id
+                capture["runner_req_id"] = capture_id
+            if bound_req_id in req_ids:
+                bindings[str(bound_req_id)] = capture
+
+        # A few vLLM adapters rewrite request IDs. Bind an unbound capture only
+        # when prompt length identifies exactly one scheduled runner request.
+        for capture in captures.values():
+            if capture.get("runner_req_id") is not None:
+                continue
+            candidates: list[str] = []
+            for req_id in req_ids:
+                if req_id in bindings:
+                    continue
+                if not isinstance(num_scheduled_tokens, dict) or int(num_scheduled_tokens.get(req_id, 0)) <= 0:
+                    continue
+                request_state = runner.requests.get(req_id)
+                prompt_token_ids = getattr(request_state, "prompt_token_ids", None)
+                if prompt_token_ids is not None and len(prompt_token_ids) == int(capture["target_len"]):
+                    candidates.append(req_id)
+            if len(candidates) > 1:
+                raise RuntimeError(
+                    "hidden-state capture cannot safely bind a rewritten request id: "
+                    f"{len(candidates)} scheduled requests have target length {int(capture['target_len'])}"
+                )
+            if len(candidates) == 1:
+                bound_req_id = candidates[0]
+                capture["runner_req_id"] = bound_req_id
+                bindings[bound_req_id] = capture
+
+        return bindings
 
     def _prime_hidden_capture_install_hook(self) -> None:
         model_runner = self.model_runner
@@ -58,19 +145,10 @@ class HiddenStateScoringMixin:
             captures = getattr(worker, "_prime_hidden_state_captures", {})
             if captures:
                 runner = worker.model_runner
-                completed_capture_req_ids: list[str] = []
-                for req_id in list(getattr(runner.input_batch, "req_ids", [])):
-                    capture = captures.get(req_id)
-                    if capture is None and len(captures) == 1:
-                        # Some vLLM versions/adapters rewrite the internal
-                        # request id before it reaches the model runner. The
-                        # full-vocab OPD teacher path is serialized by
-                        # PRIME_RL_PREFILL_HIDDEN_CONCURRENCY=1, so when there
-                        # is exactly one active capture it is the hidden-state
-                        # request currently being prefetched.
-                        _, capture = next(iter(captures.items()))
-                    if capture is None:
-                        continue
+                bindings = worker._prime_hidden_capture_bindings(captures, runner, num_scheduled_tokens)
+                completed_capture_req_ids: set[str] = set()
+                handled_capture_req_ids: set[str] = set()
+                for req_id, capture in bindings.items():
                     capture.setdefault("seen_req_ids", set()).add(str(req_id))
                     num_tokens = num_scheduled_tokens.get(req_id) if isinstance(num_scheduled_tokens, dict) else None
                     if num_tokens is None:
@@ -91,13 +169,37 @@ class HiddenStateScoringMixin:
                     copy_len = min(int(num_tokens), target_len - start_pos)
                     if copy_len <= 0:
                         continue
+                    if hidden_states.dim() != 2:
+                        raise RuntimeError(
+                            "hidden-state capture expected model-runner output [tokens, hidden], "
+                            f"got {tuple(hidden_states.shape)}"
+                        )
+                    expected_width = int(capture["expected_width"])
+                    if int(hidden_states.shape[-1]) != expected_width:
+                        raise RuntimeError(
+                            "hidden-state capture received the wrong LM-head input width: "
+                            f"got {int(hidden_states.shape[-1])}, expected {expected_width}. "
+                            "For DeepSeek-V4 this usually means a pre-hc_head/MTP tensor was captured."
+                        )
                     offset_value = runner.query_start_loc.np[req_idx]
                     offset = int(offset_value.item() if hasattr(offset_value, "item") else offset_value)
-                    target_dtype = getattr(torch, capture["dtype"])
-                    chunk = hidden_states[offset : offset + copy_len].detach().to(dtype=target_dtype).cpu().contiguous()
-                    capture["chunks"][start_pos] = chunk
+                    if offset < 0 or offset + copy_len > int(hidden_states.shape[0]):
+                        raise RuntimeError(
+                            f"hidden-state capture slice [{offset}:{offset + copy_len}] exceeds "
+                            f"model-runner output with {int(hidden_states.shape[0])} rows"
+                        )
+                    if worker._prime_hidden_capture_is_primary_worker():
+                        target_dtype = _CAPTURE_DTYPES[capture["dtype"]]
+                        chunk = (
+                            hidden_states[offset : offset + copy_len]
+                            .detach()
+                            .to(dtype=target_dtype, device="cpu")
+                            .contiguous()
+                        )
+                        capture["chunks"][start_pos] = chunk
+                    handled_capture_req_ids.add(req_id)
                     if start_pos + copy_len >= target_len:
-                        completed_capture_req_ids.append(req_id)
+                        completed_capture_req_ids.add(req_id)
 
                 # These requests use prompt_logprobs only as a stable hook into
                 # vLLM's normal prefill path. Never fall through to the real
@@ -105,13 +207,25 @@ class HiddenStateScoringMixin:
                 # it would materialize huge logits and, for DeepSeek V4, can call
                 # compute_logits outside the forward context required by MLA.
                 num_prompt_logprobs = getattr(runner, "num_prompt_logprobs", None)
+                removed_prompt_logprobs: dict[str, Any] = {}
                 if isinstance(num_prompt_logprobs, dict):
-                    for req_id in completed_capture_req_ids:
-                        num_prompt_logprobs.pop(req_id, None)
-                        request_state = runner.requests.get(req_id)
-                        if request_state is not None:
-                            request_state.in_progress_prompt_logprobs_cpu = None
-                return {}
+                    for req_id in handled_capture_req_ids:
+                        if req_id in num_prompt_logprobs:
+                            removed_prompt_logprobs[req_id] = num_prompt_logprobs.pop(req_id)
+                try:
+                    # Preserve normal prompt-logprob behavior for unrelated
+                    # requests that happen to share this scheduler batch.
+                    result = original(hidden_states, num_scheduled_tokens, *args, **kwargs)
+                finally:
+                    if isinstance(num_prompt_logprobs, dict):
+                        for req_id, value in removed_prompt_logprobs.items():
+                            if req_id not in completed_capture_req_ids:
+                                num_prompt_logprobs[req_id] = value
+                        for req_id in completed_capture_req_ids:
+                            request_state = runner.requests.get(req_id)
+                            if request_state is not None:
+                                request_state.in_progress_prompt_logprobs_cpu = None
+                return result
 
             return original(hidden_states, num_scheduled_tokens, *args, **kwargs)
 
@@ -126,13 +240,29 @@ class HiddenStateScoringMixin:
         valid attention metadata. The hook above copies each prefill chunk's
         hidden states as the prompt-logprob path sees them.
         """
+        target_len = int(target_len)
+        if target_len <= 0:
+            raise ValueError(f"hidden-state capture target_len must be positive, got {target_len}")
+        if dtype not in _CAPTURE_DTYPES:
+            raise ValueError(
+                f"unsupported hidden-state capture dtype {dtype!r}; expected one of {sorted(_CAPTURE_DTYPES)}"
+            )
         self._prime_hidden_capture_install_hook()
-        self._prime_hidden_capture_state()[request_id] = {
-            "target_len": int(target_len),
+        state = self._prime_hidden_capture_state()
+        if request_id in state:
+            raise RuntimeError(f"hidden-state capture {request_id!r} is already active")
+        state[request_id] = {
+            "target_len": target_len,
             "dtype": dtype,
+            "expected_width": self._prime_hidden_capture_expected_width(),
             "chunks": {},
             "seen_req_ids": set(),
+            "runner_req_id": None,
         }
+
+    def discard_hidden_state_capture(self, request_id: str) -> bool:
+        """Drop capture state after a failed or cancelled generation request."""
+        return self._prime_hidden_capture_state().pop(request_id, None) is not None
 
     def _prime_maybe_sweep_hidden_files(self, directory: Path) -> None:
         interval = float(os.environ.get("PRIME_RL_HIDDEN_STATE_SWEEP_INTERVAL_SECONDS", "600"))

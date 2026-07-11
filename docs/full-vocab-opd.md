@@ -102,8 +102,11 @@ Prime-RL adds a custom worker route:
 POST /prime_rl/prefill_hidden_states
 ```
 
-The route calls a worker RPC named `prefill_hidden_states`. The legacy inline
-response is an encoded tensor:
+The default `hook` backend prepares a capture on every TP worker, runs a normal
+vLLM prefill with `prompt_logprobs` enabled, and intercepts the tensor passed to
+vLLM's own `_get_prompt_logprobs_dict()`. That is the same tensor vLLM passes to
+`model.compute_logits()`. Only TP rank 0 copies the replicated final hidden
+states to CPU. The legacy inline response is an encoded tensor:
 
 ```json
 {
@@ -150,6 +153,12 @@ Full-vocab OPD currently has conservative guards:
 - Hidden states are stored as float16, bfloat16, or float32 raw tensor bytes;
   bfloat16 is the default. Filesystem transport removes the control-plane copy,
   but there is no int6 hidden-state compression yet.
+- The default hook intentionally targets vLLM's private
+  `_get_prompt_logprobs_dict()` boundary and fails at installation if that
+  boundary disappears. Re-run the live parity validator after upgrading vLLM.
+  The optional official EAGLE extractor is not a drop-in replacement unless its
+  model-specific output is separately proven to equal the post-output-norm LM-
+  head input.
 
 These limits are intentional. They prevent silent wrong KL when trainer hidden
 states or LM-head weights are sharded in a layout the trainer does not yet
@@ -173,6 +182,38 @@ For long-context or high-concurrency runs, use filesystem transport. Inline
 transport base64-encodes the full tensor over HTTP and then copies it through
 the orchestrator and packer, which is suitable only for compatibility and
 small smoke tests.
+
+### DeepSeek-V4 correctness invariant
+
+For DeepSeek-V4, the captured tensor must be the post-`hc_head`, post-output-
+norm state with shape `[tokens, config.hidden_size]`. The pre-`hc_head` residual
+used by MTP/EAGLE has width `hc_mult * hidden_size` and is not a valid input to
+`head.weight`. The hook checks the captured width against both the live vLLM LM
+head and `config.hidden_size`, and fails rather than training against the wrong
+representation.
+
+Rows remain position aligned: hidden row `p` reconstructs the distribution for
+token `p + 1`. The trainer shifts `ref_kl_weights` left by one position before
+selecting KL rows, matching the normal causal-label shift.
+
+The server may keep prefix caching enabled globally. vLLM marks requests with
+`prompt_logprobs` as `skip_reading_prefix_cache`, and the hook always sets
+`prompt_logprobs=1`; therefore the complete prompt is recomputed and no hidden
+prefix rows are omitted.
+
+Validate a live teacher after changing vLLM, model code, or quantization:
+
+```bash
+PYTHONPATH=src python tests/manual/validate_vllm_hidden_states.py \
+  --base-url http://127.0.0.1:8001/v1 \
+  --model-name /models/dpsk-v4-flash \
+  --checkpoint /models/dpsk-v4-flash
+```
+
+The validator captures hidden states, separately requests vLLM prompt
+logprobs, reconstructs sampled logits with `hidden @ head.weight.T`, and checks
+their numerical agreement. This is the production equivalent of Proof-Pilot's
+SGLang hidden-state validator.
 
 Filesystem producer files are atomically written (`tmp` + rename). The
 filesystem microbatch sender hard-links each segment into the owning rank's

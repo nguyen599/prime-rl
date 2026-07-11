@@ -191,23 +191,33 @@ async def prefill_hidden_states(request: Request):
         "prepare_hidden_state_capture",
         args=(hidden_request_id, len(token_ids), dtype),
     )
+    capture_active = True
+    try:
+        sampling_params = SamplingParams(
+            max_tokens=1,
+            temperature=1.0,
+            top_p=0.95,
+            detokenize=False,
+            prompt_logprobs=1,
+        )
+        async for _ in client.generate(
+            TokensPrompt(prompt_token_ids=token_ids),
+            sampling_params,
+            hidden_request_id,
+            priority=data.get("priority", 0),
+        ):
+            pass
 
-    sampling_params = SamplingParams(
-        max_tokens=1,
-        temperature=0.0,
-        top_p=1.0,
-        detokenize=False,
-        prompt_logprobs=1,
-    )
-    async for _ in client.generate(
-        TokensPrompt(prompt_token_ids=token_ids),
-        sampling_params,
-        hidden_request_id,
-        priority=data.get("priority", 0),
-    ):
-        pass
-
-    results = await client.collective_rpc("pop_hidden_state_capture", args=(hidden_request_id, output_path))
+        results = await client.collective_rpc("pop_hidden_state_capture", args=(hidden_request_id, output_path))
+        capture_active = False
+    finally:
+        if capture_active:
+            try:
+                await asyncio.shield(client.collective_rpc("discard_hidden_state_capture", args=(hidden_request_id,)))
+            except BaseException as exc:
+                logger.warning(
+                    "Failed to discard hidden-state capture %s after request failure: %s", hidden_request_id, exc
+                )
     if isinstance(results, list):
         result = next((item for item in results if item is not None), None)
     else:
