@@ -217,6 +217,20 @@ class Olmo3SinkRotaryEmbedding(Olmo3RotaryEmbedding):
 
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
+        self._sink_rope_init_fn = rope_init_fn
+        self._sink_rope_layer_config = layer_config
+
+    @torch.no_grad()
+    def reset_parameters(self) -> None:
+        inv_freq, self.attention_scaling = _call_rope_init_for_layer(
+            self._sink_rope_init_fn,
+            self.config,
+            self._sink_rope_layer_config,
+            self.inv_freq.device,
+            self.layer_type,
+        )
+        self.inv_freq.copy_(inv_freq)
+        self.original_inv_freq.copy_(inv_freq)
 
     @torch.no_grad()
     def forward(
@@ -363,6 +377,12 @@ class Olmo3SinkPreTrainedModel(Olmo3PreTrainedModel):
         return convert_layer_to_vllm_kernel(state_dict, layer_idx, quantize_fp8=quantize_fp8)
 
     def _init_weights(self, module):
+        if isinstance(module, Olmo3SinkRotaryEmbedding):
+            # Transformers 5.13 treats every Olmo3RotaryEmbedding subclass as the
+            # stock multi-layer buffer layout. This class intentionally owns one
+            # layer type and therefore must reset its own `inv_freq` buffers.
+            module.reset_parameters()
+            return
         super()._init_weights(module)
         # The sink parameter is new (absent from base Olmo3 checkpoints); when
         # loading such a checkpoint it is a "missing key" and lands here.
