@@ -251,6 +251,36 @@ def _proof_opd_trace(rollout, branch=None) -> dict[str, Any]:
     return _fallback_proof_opd_trace(rollout, branch)
 
 
+def _proof_opd_stage(rollout, trace: dict[str, Any]) -> str:
+    stage = str(trace.get("stage") or "").strip()
+    if stage:
+        return stage
+
+    task_record = _task_record(rollout)
+    info = _json_loads_maybe(task_record.get("info"))
+    if isinstance(info, dict):
+        stage = str(info.get("stage") or "").strip()
+        if stage:
+            return stage
+    stage = str(task_record.get("stage") or "").strip()
+    if stage:
+        return stage
+
+    answer = _task_answer_payload(rollout)
+    stage = str(answer.get("stage") or "").strip()
+    if stage:
+        return stage
+
+    stages = {
+        str(record.get("stage") or "").strip()
+        for record in trace.get("stage_records", [])
+        if isinstance(record, dict) and str(record.get("stage") or "").strip()
+    }
+    if len(stages) == 1:
+        return next(iter(stages))
+    return "multi" if stages else ""
+
+
 def _sample_proof_opd_rollouts(rollouts: list, default_sampled: list) -> list:
     if os.environ.get("PRIME_WANDB_LOG_PROOF_OPD_TRACES", "1").strip().lower() in {"0", "false", "no", "off"}:
         return default_sampled
@@ -397,6 +427,7 @@ class WandbMonitor(Monitor):
                     "input_ids",
                     "reward",
                     "task_type",
+                    "stage",
                     "proof_opd_trace",
                 ]
                 self.samples_table = wandb.Table(
@@ -477,6 +508,7 @@ class WandbMonitor(Monitor):
                     "input_ids": str(token_ids),
                     "reward": trace.reward,
                     "task_type": proof_trace.get("task_type", ""),
+                    "stage": _proof_opd_stage(rollout, proof_trace) if proof_trace else "",
                     "proof_opd_trace": _json_table_cell(proof_trace) if proof_trace else "",
                 }
                 assert list(sample.keys()) == self.samples_cols, (
