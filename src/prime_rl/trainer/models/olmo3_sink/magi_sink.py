@@ -93,6 +93,10 @@ def magi_varlen_attention_with_sink(
             "OLMo3 sink must have shape [num_sink_tokens, num_query_heads]; "
             f"got {tuple(sink.shape)} for {q.shape[1]} query heads"
         )
+    # Magi combines sink logits with FlashAttention's FP32 log-sum-exp tensor.
+    # Keep this differentiable cast local so BF16 model parameters still receive
+    # gradients while the correction and dsink calculation stay in FP32.
+    sink = sink.float()
 
     flash_fn = get_magi_sink_varlen_func(attn_impl)
     common_kwargs = {

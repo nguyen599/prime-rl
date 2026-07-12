@@ -53,6 +53,7 @@ def test_magi_backend_dispatch(monkeypatch, attn_impl, function_name):
 
     assert out.shape == q.shape
     assert flash_fn.call_args.kwargs["sink"].shape == (1, 2)
+    assert flash_fn.call_args.kwargs["sink"].dtype == torch.float32
     assert flash_fn.call_args.kwargs["sink_layout"] == "sh"
 
 
