@@ -130,6 +130,7 @@ class RolloutDispatcher:
         policy_pool: InferencePool,
         policy: Policy,
         max_inflight_rollouts: int,
+        max_inflight_questions: int | None,
         tasks_per_minute: float | None,
         max_off_policy_steps: int,
     ) -> None:
@@ -144,6 +145,7 @@ class RolloutDispatcher:
         self.max_off_policy_steps = max_off_policy_steps
 
         self.max_inflight = max_inflight_rollouts
+        self.max_inflight_questions = max_inflight_questions
         self.inflight_permits = 0
         self.rate_limiter: AsyncLimiter | None = (
             AsyncLimiter(tasks_per_minute, time_period=60) if tasks_per_minute else None
@@ -189,6 +191,18 @@ class RolloutDispatcher:
     @property
     def available_permits(self) -> int:
         return self.max_inflight - self.inflight_permits
+
+    def can_open_fresh_question(self, kind: RolloutKind) -> bool:
+        """Whether another question group of ``kind`` may be opened.
+
+        This cap only gates fresh groups. Multi-turn work already running
+        inside an existing group keeps its task and client, so verifier/meta/
+        refine continuations are never blocked by this dispatcher limit.
+        """
+        if self.max_inflight_questions is None:
+            return True
+        inflight_questions = sum(group.kind == kind for group in self.groups.values())
+        return inflight_questions < self.max_inflight_questions
 
     @property
     def inflight_by_env(self) -> dict[tuple[RolloutKind, str], int]:
@@ -357,6 +371,9 @@ class RolloutDispatcher:
             cost = group.rollouts_to_schedule if env.requires_group_scoring else 1
             if cost <= self.available_permits:
                 return await self.schedule_group_rollout(gid, group)
+
+        if not self.can_open_fresh_question(kind):
+            return False
 
         fresh = self.next_fresh_group(kind, envs)
         if fresh is None:
@@ -678,6 +695,7 @@ class RolloutDispatcher:
             "dispatcher/queued/eval": float(self.queued_eval_examples),
             "dispatcher/mode": float(self.mode == DispatcherMode.PREFER_EVAL),
             "dispatcher/groups_in_flight": float(len(self.groups)),
+            "dispatcher/question_capacity": float(self.max_inflight_questions or 0),
             "dispatcher/off_policy_level_max": float(self.max_off_policy_level),
             "dispatcher/off_policy_level_mean": self.mean_off_policy_level,
         }

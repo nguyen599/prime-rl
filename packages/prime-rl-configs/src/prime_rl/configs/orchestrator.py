@@ -515,6 +515,9 @@ class OrchestratorConfig(BaseConfig):
     max_inflight_rollouts: int | None = Field(None, ge=1)
     """Maximum number of rollouts kept in-flight. Required for token-based batching. With ``batch_size`` set, defaults to ``batch_size * oversampling_factor`` (or ``batch_size`` when ``oversampling_factor`` is unset)."""
 
+    max_inflight_questions: int | None = Field(None, ge=1)
+    """Maximum number of question groups kept in-flight. Existing groups may continue multi-turn environment work, but the dispatcher will not open a fresh question while this cap is reached. None disables the question-level cap."""
+
     group_size: int = Field(1, ge=1, validation_alias=AliasChoices("group_size", "rollouts_per_example"))
     """Output sequences returned per example during training."""
 

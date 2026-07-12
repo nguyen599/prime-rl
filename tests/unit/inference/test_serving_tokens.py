@@ -24,9 +24,11 @@ from prime_rl.inference.vllm.serving_tokens import (
     PrimeRlServingTokens,
     _build_usage,
     _client_set_max_tokens,
+    _extract_request_priority,
     _FinalOutputCapture,
     _GenerateRoutedExpertsCapture,
 )
+from vllm.sampling_params import SamplingParams
 
 
 def _decode_routed_experts(encoded: dict) -> np.ndarray:
@@ -108,6 +110,15 @@ def test_client_set_max_tokens_detects_unset():
 
     body_without_sp = {"token_ids": [1, 2, 3]}
     assert asyncio.run(_client_set_max_tokens(_FakeRawRequest(body_without_sp))) is False
+
+
+def test_prime_priority_is_promoted_and_removed_from_sampling_metadata():
+    sampling_params = SamplingParams(extra_args={"prime_priority": -42, "other": "value"})
+
+    priority = _extract_request_priority(sampling_params, default=0)
+
+    assert priority == -42
+    assert sampling_params.extra_args == {"other": "value"}
 
 
 class _FakeOutput:

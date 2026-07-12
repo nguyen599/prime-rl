@@ -72,6 +72,16 @@ class PrimeRlGenerateResponse(GenerateResponse):
     usage: UsageInfo | None = None
 
 
+def _extract_request_priority(sampling_params: SamplingParams, default: int) -> int:
+    """Promote Prime's internal sampling metadata to vLLM request priority."""
+    sampling_extra = sampling_params.extra_args or {}
+    if "prime_priority" not in sampling_extra:
+        return default
+    priority = int(sampling_extra.pop("prime_priority"))
+    sampling_params.extra_args = sampling_extra
+    return priority
+
+
 class _GenerateRoutedExpertsCapture(RoutedExpertsCapture):
     def post_process(self, response: GenerateResponse) -> PrimeRlGenerateResponse:
         choices = [
@@ -248,6 +258,7 @@ class PrimeRlServingTokens(ServingTokens):
             )
 
         sampling_params: SamplingParams = request.sampling_params
+        request_priority = _extract_request_priority(sampling_params, request.priority)
 
         # Upstream ``ServingTokens.serve_tokens`` parses ``request.kv_transfer_params``
         # but never threads it into the engine, so PD disagg never fires on
@@ -297,7 +308,7 @@ class PrimeRlServingTokens(ServingTokens):
             request_id,
             lora_request=lora_request,
             trace_headers=trace_headers,
-            priority=request.priority,
+            priority=request_priority,
             data_parallel_rank=self._get_data_parallel_rank(raw_request),
         )
 
