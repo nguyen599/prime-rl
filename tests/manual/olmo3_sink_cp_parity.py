@@ -31,6 +31,11 @@ class _Logger:
 
 
 def _make_config(attn_impl: str) -> Olmo3SinkConfig:
+    rope_parameters = {
+        None: {"rope_type": "default", "rope_theta": 500_000.0},
+        "full_attention": {"rope_type": "default", "rope_theta": 500_000.0},
+        "sliding_attention": {"rope_type": "default", "rope_theta": 500_000.0},
+    }
     config = Olmo3SinkConfig(
         vocab_size=256,
         hidden_size=128,
@@ -46,6 +51,7 @@ def _make_config(attn_impl: str) -> Olmo3SinkConfig:
         sliding_window=32,
         attention_dropout=0.0,
         sink_init_value=-2.0,
+        rope_parameters=rope_parameters,
     )
     config._attn_implementation = attn_impl
     return config
