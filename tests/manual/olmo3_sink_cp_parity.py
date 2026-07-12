@@ -27,7 +27,7 @@ from prime_rl.utils.cp import setup_cp_params
 class _Logger:
     def info(self, message, *args):
         if dist.get_rank() == 0:
-            print(message % args if args else message, flush=True)
+            print(message.format(*args) if args else message, flush=True)
 
 
 def _make_config(attn_impl: str) -> Olmo3SinkConfig:
