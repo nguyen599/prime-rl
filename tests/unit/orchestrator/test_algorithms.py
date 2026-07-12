@@ -99,6 +99,7 @@ def test_opd_filesystem_hidden_transport_keeps_payload_out_of_sample():
     )
     pool.score_hidden_states = AsyncMock(return_value=ref)
     algo.teacher_pool = pool
+    algo._teacher_ready = True
     rollout = _make_rollout([_make_sample()])
 
     asyncio.run(algo.score_rollout(rollout))
@@ -112,6 +113,35 @@ def test_opd_filesystem_hidden_transport_keeps_payload_out_of_sample():
         dtype="bfloat16",
         storage_dir=Path("/shared/hidden"),
     )
+
+
+def test_opd_setup_connects_teacher_without_waiting_for_readiness():
+    config = _build(type="opd", teacher=FROZEN)
+    algo = OPDAlgorithm(config, MagicMock())
+    pool = MagicMock(spec=StaticInferencePool)
+    algo.connect = AsyncMock(return_value=pool)
+
+    asyncio.run(algo.setup())
+
+    algo.connect.assert_awaited_once_with(config.teacher, wait_for_ready=False)
+    assert algo.teacher_pool is pool
+
+
+def test_opd_waits_for_teacher_only_on_first_scoring_request():
+    config = _build(type="opd", teacher=FROZEN)
+    algo = OPDAlgorithm(config, MagicMock())
+    pool = MagicMock(spec=StaticInferencePool)
+    pool.wait_for_ready = AsyncMock()
+
+    async def run():
+        await asyncio.gather(
+            algo._ensure_teacher_ready(pool),
+            algo._ensure_teacher_ready(pool),
+        )
+
+    asyncio.run(run())
+
+    pool.wait_for_ready.assert_awaited_once_with(config.teacher.name)
 
 
 def test_sft_requires_teacher():

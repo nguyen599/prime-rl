@@ -54,7 +54,10 @@ if TYPE_CHECKING:
 
 
 async def connect_frozen_pool(
-    config: FrozenModelConfig, *, renderer_config: RendererConfig | None = None
+    config: FrozenModelConfig,
+    *,
+    renderer_config: RendererConfig | None = None,
+    wait_for_ready: bool = True,
 ) -> InferencePool:
     """Connect a client pool to an inline frozen model and wait for it to be
     ready. The endpoint is externally hosted — prime-rl connects and waits,
@@ -74,7 +77,8 @@ async def connect_frozen_pool(
         )
     else:
         pool = await setup_inference_pool(config, model_name=config.name)
-    await pool.wait_for_ready(config.name)
+    if wait_for_ready:
+        await pool.wait_for_ready(config.name)
     return pool
 
 
@@ -128,12 +132,17 @@ class Algorithm:
         and resolve each reference via :meth:`connect`. The base has nothing
         to connect."""
 
-    async def connect(self, reference: FrozenModelConfig) -> InferencePool:
+    async def connect(
+        self,
+        reference: FrozenModelConfig,
+        *,
+        wait_for_ready: bool = True,
+    ) -> InferencePool:
         """Connect a client pool to a frozen model endpoint and track it in
         ``connected_pools`` — the host closes what the algorithm opened, at
         shutdown. The live policy is never connected here; opsd receives the
         policy pool directly."""
-        pool = await connect_frozen_pool(reference)
+        pool = await connect_frozen_pool(reference, wait_for_ready=wait_for_ready)
         self.connected_pools.append(pool)
         return pool
 

@@ -32,16 +32,31 @@ class OPDAlgorithm(Algorithm):
         self.opd_config = config
         self.teacher = config.teacher
         self.teacher_pool: StaticInferencePool | None = None  # static teacher endpoint, connected in setup()
+        self._teacher_ready = False
+        self._teacher_ready_lock = asyncio.Lock()
 
     async def setup(self) -> None:
-        pool = await self.connect(self.teacher)
+        # Policy rollout generation can start while a large teacher endpoint
+        # is still loading/compiling. The first completed rollout waits for
+        # readiness immediately before teacher scoring.
+        pool = await self.connect(self.teacher, wait_for_ready=False)
         if not isinstance(pool, StaticInferencePool):
             raise TypeError("opd teacher must be a static endpoint — prefill scoring needs fixed endpoints")
         self.teacher_pool = pool
 
+    async def _ensure_teacher_ready(self, pool: StaticInferencePool) -> None:
+        if self._teacher_ready:
+            return
+        async with self._teacher_ready_lock:
+            if self._teacher_ready:
+                return
+            await pool.wait_for_ready(self.teacher.name)
+            self._teacher_ready = True
+
     async def score_rollout(self, rollout: Rollout) -> None:
         pool = self.teacher_pool
         assert pool is not None, "teacher pool not connected — Algorithm.setup() must run first"
+        await self._ensure_teacher_ready(pool)
 
         async def score_sample(sample: TrainingSample) -> None:
             token_ids = list(sample.token_ids)
