@@ -1,10 +1,11 @@
 """Manual CP canary for Olmo3Sink Ulysses attention.
 
-Run on a GPU host with the patched FA3 sink kernel available:
+Run on a GPU host with MagiAttention sink extensions available:
 
-    torchrun --standalone --nproc-per-node=2 tests/manual/olmo3_sink_cp_parity.py
+    OLMO3_SINK_ATTN=olmo3_sink_fa2 torchrun --standalone --nproc-per-node=2 \
+        tests/manual/olmo3_sink_cp_parity.py
 
-The test compares a small CP=2 Ulysses `olmo3_sink_fa3` model against the
+The test compares a small CP=2 Ulysses sink model against the
 sink-aware eager full-sequence reference, then verifies sink gradients are
 nonzero after a backward pass.
 """
@@ -66,14 +67,15 @@ def main() -> None:
     if dist.get_world_size() != 2:
         raise RuntimeError("This canary is intentionally written for CP=2.")
 
+    attn_impl = os.environ.get("OLMO3_SINK_ATTN", "olmo3_sink_fa2")
     torch.manual_seed(1234)
     full_model = Olmo3SinkForCausalLM(_make_config("eager")).to(device=device, dtype=dtype).eval()
-    cp_model = Olmo3SinkForCausalLM(_make_config("olmo3_sink_fa3")).to(device=device, dtype=dtype).train()
+    cp_model = Olmo3SinkForCausalLM(_make_config(attn_impl)).to(device=device, dtype=dtype).train()
     cp_model.load_state_dict(full_model.state_dict())
 
     cp_group = dist.group.WORLD
     substitute_hf_ulysses_attn(cp_group)
-    substitute_ulysses_attn(cp_group, attn_impl="olmo3_sink_fa3")
+    substitute_ulysses_attn(cp_group, attn_impl=attn_impl)
 
     seq_len = 64
     input_ids = (torch.arange(seq_len, device=device).reshape(1, seq_len) % 200) + 3

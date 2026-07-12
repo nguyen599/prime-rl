@@ -8,6 +8,7 @@ Olmo3Sink is the OLMo3 training/inference path used for proof-reasoning experime
 |---|---|
 | `src/prime_rl/trainer/models/olmo3_sink/configuration_olmo3_sink.py` | `Olmo3SinkConfig`, registered as `model_type = "olmo3_sink"`. |
 | `src/prime_rl/trainer/models/olmo3_sink/modeling_olmo3_sink.py` | Trainer-side model implementation with attention sinks and OLMo3 per-layer RoPE handling. |
+| `src/prime_rl/trainer/models/olmo3_sink/magi_sink.py` | Lazy FA2/FA3/FA4 dispatcher for MagiAttention's sink extensions. |
 | `src/prime_rl/trainer/models/olmo3_sink/vllm_adapter.py` | vLLM adapter with packed `qkv_proj`, packed `gate_up_proj`, and per-head sink loading. |
 | `src/prime_rl/trainer/models/olmo3_sink/converting_olmo3_sink.py` | Layer conversion for vLLM kernel-format weight transfer, including optional FP8 quantized transfer. |
 
@@ -20,13 +21,57 @@ Use the custom trainer model implementation for Olmo3Sink:
 ```toml
 [trainer.model]
 impl = "custom"
-attn = "flash_attention_3"
+attn = "olmo3_sink_fa2"
 cp = 2
 cp_style = "ulysses"
 fp8 = false
 ```
 
 Context parallelism (`cp`) is useful for long contexts on dense 32B models. The current 4xH200 smoke layout uses `cp = 2` over two trainer GPUs.
+
+### Sink Backends
+
+| Prime-RL name | Intended hardware | Sliding window | Notes |
+|---|---|---|---|
+| `olmo3_sink_fa2` | Supported by the installed FA2 build | Yes | Default for standard OLMo3 mixed full/sliding layers. |
+| `olmo3_sink_fa3` | Hopper (SM90) | Yes | Uses Magi's FA3 sink extension. |
+| `olmo3_sink_fa4` | Blackwell (SM100+) | No | Only valid when every model layer uses full attention. |
+
+All three paths preserve gradients to `self_attn.sinks`. Generic `flash_attention_*`
+names are rejected for Olmo3Sink because those interfaces can silently drop `s_aux`.
+Context parallel runs must use `cp_style = "ulysses"`; ring attention is not sink-aware.
+
+### Magi Installation
+
+The sink adapters need Magi's Python/Triton correction utilities, not its distributed
+attention CUDA/communication extensions. A minimal install can therefore skip Magi's
+CUDA build and reuse the FlashAttention packages already present in the image:
+
+```bash
+git clone https://github.com/SandAI-org/MagiAttention.git
+cd MagiAttention
+MAGI_ATTENTION_SKIP_CUDA_BUILD=1 \
+  pip install --no-build-isolation --no-deps .
+pip install --no-build-isolation --no-deps ./extensions
+```
+
+MagiAttention `efaabdbc` currently imports its optional DSA test helper from the
+extensions package, so `expecttest` must also be installed. The production image pins
+the Magi commit and installs that small dependency explicitly.
+
+Run a single-GPU kernel canary with:
+
+```bash
+python tests/manual/olmo3_sink_magi_kernel.py --backend olmo3_sink_fa2
+python tests/manual/olmo3_sink_magi_kernel.py --backend olmo3_sink_fa3
+```
+
+Run the CP parity canary with:
+
+```bash
+OLMO3_SINK_ATTN=olmo3_sink_fa2 torchrun --standalone --nproc-per-node=2 \
+  tests/manual/olmo3_sink_cp_parity.py
+```
 
 ## FP8 Support
 

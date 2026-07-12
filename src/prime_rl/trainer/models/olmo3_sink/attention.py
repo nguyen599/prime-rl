@@ -1,9 +1,9 @@
 # Copyright 2026 proof-pilot. Apache-2.0.
-"""transformers attention-interface adapter for the in-kernel FA3 sink.
+"""Transformers attention-interface adapter for MagiAttention sink kernels.
 
-Registers `attn_implementation="olmo3_sink_fa3"`. The adapter converts transformers'
-[B, H, S, D] layout to FA3 varlen [total, H, D] + cu_seqlens and calls the patched
-in-kernel sink kernel. Deliberately NOT registered in the mask interface, so
+Registers explicit FA2/FA3/FA4 implementations. The adapter converts transformers'
+[B, H, S, D] layout to varlen [total, H, D] + cu_seqlens. Deliberately not
+registered in the mask interface, so
 `create_causal_mask` returns None (no [S,S] mask is built) and we rely on cu_seqlens.
 """
 from __future__ import annotations
@@ -15,12 +15,10 @@ from transformers.modeling_flash_attention_utils import (
     prepare_fa_kwargs_from_position_ids,
 )
 
-from .fa3_sink_kernel import fa3_varlen_attn_with_sink_kernel
-
-ATTN_NAME = "olmo3_sink_fa3"
+from .magi_sink import MAGI_SINK_ATTN_IMPLS, magi_varlen_attention_with_sink
 
 
-def fa3_sink_attention_forward(
+def magi_sink_attention_forward(
     module,
     query: torch.Tensor,   # [B, Hq, S, D]
     key: torch.Tensor,     # [B, Hkv, S, D]
@@ -32,8 +30,6 @@ def fa3_sink_attention_forward(
     s_aux: torch.Tensor | None = None,
     **kwargs,
 ):
-    # Note: `dropout` is accepted for signature compatibility but not applied (Olmo3's
-    # attention_dropout defaults to 0.0; FA3 varlen dropout is not threaded here).
     B, Hq, S, D = query.shape
     Hkv = key.shape[1]
     sink = s_aux if s_aux is not None else module.sinks
@@ -63,12 +59,23 @@ def fa3_sink_attention_forward(
             max_q = max_k = S
 
     window = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
-    out = fa3_varlen_attn_with_sink_kernel(
+    attn_impl = module.config._attn_implementation
+    out = magi_varlen_attention_with_sink(
         q, k, v, sink, cu_q, cu_k, max_q, max_k,
-        softmax_scale=scaling, causal=True, window_size=window,
+        attn_impl=attn_impl,
+        softmax_scale=scaling,
+        causal=True,
+        window_size=window,
+        dropout_p=dropout,
     )  # [B*S, Hq, D]
     return out.reshape(B, S, Hq, D), None
 
 
-def register_fa3_sink_attention() -> None:
-    AttentionInterface.register(ATTN_NAME, fa3_sink_attention_forward)
+def register_magi_sink_attentions() -> None:
+    for attn_name in MAGI_SINK_ATTN_IMPLS:
+        AttentionInterface.register(attn_name, magi_sink_attention_forward)
+
+
+# Compatibility aliases for callers written against the first FA3-only adapter.
+fa3_sink_attention_forward = magi_sink_attention_forward
+register_fa3_sink_attention = register_magi_sink_attentions

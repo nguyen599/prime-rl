@@ -695,7 +695,7 @@ def train(config: TrainerConfig):
                 param.grad.mul_(parallel_dims.fsdp_gradient_divide_factor)
         logger.debug(f"Scaled gradients in {format_time(time.perf_counter() - gradient_scale_start_time)}")
 
-        if is_first_step and config.model.attn == "olmo3_sink_fa3":
+        if is_first_step and config.model.attn.startswith("olmo3_sink_fa"):
             from prime_rl.trainer.models.olmo3_sink.grad_check import assert_sink_grad_nonzero
 
             grad_canary_start_time = time.perf_counter()

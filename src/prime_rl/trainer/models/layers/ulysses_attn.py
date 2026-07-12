@@ -34,6 +34,7 @@ import torch.distributed.nn.functional as dist_nn
 # ring_flash_attn's DATA_PARAMS pattern so the patched attention path can
 # reach the *full* (un-sharded) cu_seqlens / max_seqlen at call time.
 ULYSSES_PARAMS: dict = {}
+OLMO3_SINK_ATTN_IMPLS = ("olmo3_sink_fa2", "olmo3_sink_fa3", "olmo3_sink_fa4")
 
 
 def update_ulysses_params(cu_seqlens: torch.Tensor, max_seqlen: int) -> None:
@@ -133,7 +134,7 @@ def _ulysses_local_head_slice(tensor: torch.Tensor, cp_group: dist.ProcessGroup,
     return tensor.narrow(0, rank * heads_per_rank, heads_per_rank)
 
 
-def ulysses_olmo3_sink_fa3_attention_forward(
+def ulysses_olmo3_sink_attention_forward(
     module,
     query: torch.Tensor,
     key: torch.Tensor,
@@ -145,15 +146,15 @@ def ulysses_olmo3_sink_fa3_attention_forward(
     s_aux: torch.Tensor | None = None,
     **kwargs,
 ):
-    """Ulysses wrapper for Olmo3Sink's FA3 sink attention interface.
+    """Ulysses wrapper for Olmo3Sink's MagiAttention sink interfaces.
 
-    Olmo3Sink registers its own ``olmo3_sink_fa3`` attention key instead of using
+    Olmo3Sink registers its own ``olmo3_sink_fa*`` attention keys instead of using
     HF's ``flash_attention_2`` function. Without this registration, CP shards the
     sequence but the sink attention still runs locally on each shard. This wrapper
-    performs the Ulysses seq<->head all-to-all, calls the sink FA3 kernel over
+    performs the Ulysses seq<->head all-to-all, calls the selected sink kernel over
     the full sequence and local head slice, then scatters the result back.
     """
-    del attention_mask, dropout, kwargs
+    del attention_mask, kwargs
     assert query.size(0) == 1, "prime-rl Ulysses CP expects batch=1 packed inputs"
 
     cp_size = dist.get_world_size(group=module._olmo3_sink_ulysses_group)
@@ -174,9 +175,9 @@ def ulysses_olmo3_sink_fa3_attention_forward(
     sink = _ulysses_local_head_slice(sink, cp_group, cp_size)
     window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
 
-    from prime_rl.trainer.models.olmo3_sink.fa3_sink_kernel import fa3_varlen_attn_with_sink_kernel
+    from prime_rl.trainer.models.olmo3_sink.magi_sink import magi_varlen_attention_with_sink
 
-    out = fa3_varlen_attn_with_sink_kernel(
+    out = magi_varlen_attention_with_sink(
         q,
         k,
         v,
@@ -185,12 +186,18 @@ def ulysses_olmo3_sink_fa3_attention_forward(
         cu_seqlens,
         max_seqlen,
         max_seqlen,
+        attn_impl=module.config._attn_implementation,
         softmax_scale=scaling,
         causal=True,
         window_size=window_size,
+        dropout_p=dropout,
     )
     out = _all_to_all_head_to_seq(out, cp_size, cp_group)
     return out.reshape(1, out.shape[0], out.shape[1], out.shape[2]), None
+
+
+# Compatibility name retained for external callers of the first FA3-only wrapper.
+ulysses_olmo3_sink_fa3_attention_forward = ulysses_olmo3_sink_attention_forward
 
 
 def substitute_ulysses_attn(
@@ -333,12 +340,14 @@ def substitute_hf_ulysses_attn(process_group: dist.ProcessGroup) -> None:
 
     if ALL_ATTENTION_FUNCTIONS is not None:
 
-        def _register_ulysses_olmo3_sink_attention() -> None:
-            ALL_ATTENTION_FUNCTIONS["olmo3_sink_fa3"] = ulysses_olmo3_sink_fa3_attention_forward
+        def _register_ulysses_olmo3_sink_attentions() -> None:
+            for attn_name in OLMO3_SINK_ATTN_IMPLS:
+                ALL_ATTENTION_FUNCTIONS[attn_name] = ulysses_olmo3_sink_attention_forward
             try:
                 from transformers import AttentionInterface
 
-                AttentionInterface.register("olmo3_sink_fa3", ulysses_olmo3_sink_fa3_attention_forward)
+                for attn_name in OLMO3_SINK_ATTN_IMPLS:
+                    AttentionInterface.register(attn_name, ulysses_olmo3_sink_attention_forward)
             except Exception:
                 # Older/newer transformers may expose only ALL_ATTENTION_FUNCTIONS.
                 pass
@@ -377,12 +386,13 @@ def substitute_hf_ulysses_attn(process_group: dist.ProcessGroup) -> None:
             return attn_out, None
 
         ALL_ATTENTION_FUNCTIONS["flash_attention_2"] = _ulysses_flash_attention_forward_v2
-        _register_ulysses_olmo3_sink_attention()
+        _register_ulysses_olmo3_sink_attentions()
 
         try:
             from prime_rl.trainer.models.olmo3_sink import attention as olmo3_sink_attention
 
-            olmo3_sink_attention.register_fa3_sink_attention = _register_ulysses_olmo3_sink_attention
+            olmo3_sink_attention.register_magi_sink_attentions = _register_ulysses_olmo3_sink_attentions
+            olmo3_sink_attention.register_fa3_sink_attention = _register_ulysses_olmo3_sink_attentions
         except Exception:
             pass
 

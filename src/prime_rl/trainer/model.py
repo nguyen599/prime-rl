@@ -507,6 +507,15 @@ def get_model(
         ),
     )
     model_config = coerce_olmo3_sink_config(model_config, config.attn)
+    if config.attn.startswith("olmo3_sink_fa"):
+        from prime_rl.trainer.models.olmo3_sink.magi_sink import validate_magi_sink_backend
+
+        validate_magi_sink_backend(config.attn)
+        if config.attn == "olmo3_sink_fa4" and "sliding_attention" in getattr(model_config, "layer_types", []):
+            raise ValueError(
+                "olmo3_sink_fa4 cannot run OLMo3 sliding-attention layers because Magi's FA4 sink "
+                "interface has no window argument; use olmo3_sink_fa2"
+            )
     model_config.use_cache = False
     is_vlm_arch = is_vlm_architecture(model_config)
 

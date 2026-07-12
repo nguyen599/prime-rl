@@ -24,7 +24,9 @@ AttnImplementation: TypeAlias = Literal[
     "flash_attention_2",
     "flash_attention_3",
     "fa4",
+    "olmo3_sink_fa2",
     "olmo3_sink_fa3",
+    "olmo3_sink_fa4",
 ]
 EPCommBackend: TypeAlias = Literal["torch", "deepep"]
 
@@ -128,7 +130,7 @@ class ModelConfig(BaseModelConfig):
     """Sequence length the model is trained on."""
 
     attn: AttnImplementation = "flash_attention_2"
-    """Attention implementation. With CP enabled, ring attention uses the matching kernel family (FA2/FA3/FA4); Olmo3Sink uses its sink-aware FA3 adapter."""
+    """Attention implementation. With CP enabled, ring attention uses the matching kernel family (FA2/FA3/FA4); Olmo3Sink uses explicit Magi sink adapters."""
 
     compile: CompileConfig | None = CompileConfig()
     """Compile the model with ``torch.compile``."""
@@ -220,17 +222,27 @@ class ModelConfig(BaseModelConfig):
 
     @model_validator(mode="after")
     def cp_only_with_flash_attn(self):
-        if self.cp > 1 and self.attn not in ["flash_attention_2", "flash_attention_3", "fa4", "olmo3_sink_fa3"]:
-            raise ValueError("CP is only supported with flash attention 2, flash attention 3, fa4, or olmo3_sink_fa3")
-        if self.cp > 1 and self.attn in ("flash_attention_3", "fa4", "olmo3_sink_fa3") and self.impl != "custom":
+        flash_attn_impls = {
+            "flash_attention_2",
+            "flash_attention_3",
+            "fa4",
+            "olmo3_sink_fa2",
+            "olmo3_sink_fa3",
+            "olmo3_sink_fa4",
+        }
+        if self.cp > 1 and self.attn not in flash_attn_impls:
+            raise ValueError(f"CP requires a FlashAttention backend; got {self.attn!r}")
+        if self.cp > 1 and self.attn in flash_attn_impls - {"flash_attention_2"} and self.impl != "custom":
             # Both ring and ulysses route FA3/FA4 through our custom FlashAttention class:
             # ring patches `_compute_attention` with the ring kernel, ulysses patches it with
             # the all-to-all wrapper around the FA3/FA4 kernel. The HF path patches
             # `_flash_attention_forward` which only wraps FA2.
             raise ValueError(
                 f"CP with {self.attn} requires model.impl='custom' "
-                "(FA3/FA4 paths are only implemented for the custom model attention class)"
+                "(this path is only implemented for the custom model attention class)"
             )
+        if self.cp > 1 and self.attn.startswith("olmo3_sink_fa") and self.cp_style != "ulysses":
+            raise ValueError("Olmo3Sink context parallelism requires cp_style='ulysses'")
         return self
 
     @model_validator(mode="after")

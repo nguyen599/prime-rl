@@ -9,8 +9,6 @@ the current Python process; it does NOT make a checkpoint portable on its own
 
 from __future__ import annotations
 
-import warnings
-
 from transformers import (
     AutoConfig,
     AutoModel,
@@ -24,29 +22,16 @@ _REGISTERED = False
 
 
 def register_olmo3_sink(exist_ok: bool = True) -> None:
-    """Register Olmo3Sink config/model + the `olmo3_sink_fa3` attention impl."""
+    """Register Olmo3Sink config/model and its MagiAttention sink backends."""
     global _REGISTERED
     if _REGISTERED:
         return
     AutoConfig.register("olmo3_sink", Olmo3SinkConfig, exist_ok=exist_ok)
     AutoModel.register(Olmo3SinkConfig, Olmo3SinkModel, exist_ok=exist_ok)
     AutoModelForCausalLM.register(Olmo3SinkConfig, Olmo3SinkForCausalLM, exist_ok=exist_ok)
-    # The FA3 adapter (`attention.py`) imports `flash_attn_interface` (patched FA3 build)
-    # at module scope. Import it lazily HERE so that `import olmo3_sink` + class
-    # registration work on machines without FA3 (eager backend, as documented in the
-    # README). Only a missing flash_attn_interface is tolerated -- anything else re-raises.
-    # Requesting attn_implementation="olmo3_sink_fa3" on such a machine still fails loudly
-    # inside transformers (the impl was never registered).
-    try:
-        from .attention import register_fa3_sink_attention
-    except ModuleNotFoundError as e:
-        if e.name != "flash_attn_interface":
-            raise
-        warnings.warn(
-            "olmo3_sink: patched FA3 (flash_attn_interface) not available -- "
-            "'olmo3_sink_fa3' attention backend NOT registered; eager backend only.",
-            stacklevel=2,
-        )
-    else:
-        register_fa3_sink_attention()
+    # Registration itself is dependency-free. The selected adapter imports Magi and
+    # its matching FA package lazily, then fails with an actionable error if absent.
+    from .attention import register_magi_sink_attentions
+
+    register_magi_sink_attentions()
     _REGISTERED = True

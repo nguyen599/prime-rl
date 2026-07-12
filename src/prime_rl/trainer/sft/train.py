@@ -419,7 +419,7 @@ def train(config: SFTConfig):
                 if param.grad is not None:
                     param.grad.mul_(grad_scale)
 
-        if is_first_step and config.model.attn == "olmo3_sink_fa3":
+        if is_first_step and config.model.attn.startswith("olmo3_sink_fa"):
             from prime_rl.trainer.models.olmo3_sink.grad_check import assert_sink_grad_nonzero
 
             assert_sink_grad_nonzero(model, logger, context="SFT Olmo3Sink")

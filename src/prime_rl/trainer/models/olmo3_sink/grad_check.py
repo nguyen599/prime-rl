@@ -51,7 +51,7 @@ def assert_sink_grad_nonzero(model: torch.nn.Module, logger, *, context: str = "
         raise RuntimeError(
             f"{context} sink-gradient canary failed: found {found.item()} sink "
             "parameters but all sink gradients were zero. Check that "
-            "attn='olmo3_sink_fa3' is selected and the CP/Ulysses sink wrapper "
+            "a sink-aware olmo3_sink_fa* backend is selected and the CP/Ulysses wrapper "
             "is registered."
         )
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0

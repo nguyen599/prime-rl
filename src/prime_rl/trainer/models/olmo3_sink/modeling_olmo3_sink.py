@@ -12,7 +12,7 @@ Three changes
    `[num_attention_heads]` learnable parameter, passed to the attention kernel as
    `s_aux`. The kernel appends it as an extra column of softmax logits that is
    dropped after normalization (see gpt-oss). NOTE: the `sdpa` backend does NOT
-   support `s_aux`; use `eager` (debug) or `olmo3_sink_fa3`. We assert this in
+   support `s_aux`; use `eager` (debug) or an `olmo3_sink_fa*` backend. We assert this in
    the attention forward so generic FlashAttention backends cannot silently drop
    sink logits.
 
@@ -280,11 +280,13 @@ class Olmo3SinkAttention(Olmo3Attention):
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
         attn_impl = self.config._attn_implementation
-        if attn_impl not in {"eager", "olmo3_sink_fa3"}:
+        from .magi_sink import MAGI_SINK_ATTN_IMPLS
+
+        if attn_impl != "eager" and attn_impl not in MAGI_SINK_ATTN_IMPLS:
             raise ValueError(
                 "Olmo3Sink uses attention sinks (s_aux). Generic attention backends "
                 f"({attn_impl!r}) may silently ignore the sink argument. Load with "
-                "attn_implementation='olmo3_sink_fa3' for training, or 'eager' for "
+                "attn_implementation='olmo3_sink_fa2' for portable training, or 'eager' for "
                 "CPU/debug reference checks."
             )
 
@@ -430,7 +432,7 @@ class Olmo3SinkModel(Olmo3SinkPreTrainedModel, Olmo3Model):
         impl = self.config._attn_implementation or ""
         if (
             getattr(self.config, "reuse_packing_metadata", True)
-            and ("flash" in impl or impl == "olmo3_sink_fa3")
+            and ("flash" in impl or impl.startswith("olmo3_sink_fa"))
             and kwargs.get("cu_seq_lens_q") is None  # don't clobber model-provided varlen kwargs
             and _is_packed_sequence(position_ids, inputs_embeds.shape[0])
         ):
@@ -500,13 +502,12 @@ class Olmo3SinkForCausalLM(Olmo3SinkPreTrainedModel, Olmo3ForCausalLM):
         self.post_init()
 
 
-# Auto-register the in-kernel FA3 sink attention so `attn_implementation="olmo3_sink_fa3"`
-# works on import (incl. trust_remote_code). Guarded: if the patched FA3 isn't installed,
-# import still succeeds and other backends (eager) remain usable.
+# Auto-register MagiAttention sink adapters so `attn_implementation="olmo3_sink_fa*"`
+# works on import (including trust_remote_code). Kernel dependencies load lazily.
 try:
-    from .attention import register_fa3_sink_attention
+    from .attention import register_magi_sink_attentions
 
-    register_fa3_sink_attention()
+    register_magi_sink_attentions()
 except Exception:  # noqa: BLE001
     pass
 
