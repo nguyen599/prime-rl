@@ -2,15 +2,10 @@ from __future__ import annotations
 
 import re
 
-try:
-    import deep_gemm
-except ImportError:
-    deep_gemm = None  # CPU-only environments don't ship deep_gemm; FP8 paths
-    # are GPU-only at runtime, so leaving the symbol None is safe — only the
-    # autograd Function bodies below actually call into it.
 import torch
 from torch import nn
 
+from prime_rl.trainer.models.layers.deep_gemm_backend import require_deep_gemm
 from prime_rl.trainer.models.kernels.fp8_utils import (
     per_block_cast_to_fp8_tp_triton,
     per_block_cast_to_fp8_triton,
@@ -29,7 +24,7 @@ class _FP8BlockwiseMM(torch.autograd.Function):
         weight_fp8 = per_block_cast_to_fp8_triton(weight, False, block_size)
 
         out = torch.empty((x_2d.size(0), weight.size(0)), device=x.device, dtype=out_dtype)
-        deep_gemm.fp8_gemm_nt(x_fp8, weight_fp8, out)
+        require_deep_gemm().fp8_gemm_nt(x_fp8, weight_fp8, out)
 
         ctx.save_for_backward(x_2d, weight)
         ctx.x_shape = x_shape
@@ -47,7 +42,7 @@ class _FP8BlockwiseMM(torch.autograd.Function):
             grad_output_fp8 = per_token_cast_to_fp8_triton(grad_output_2d, False, block_size)
             weight_dx_fp8 = per_block_cast_to_fp8_tp_triton(weight, False, block_size)
             grad_x_2d = torch.empty_like(x_2d)
-            deep_gemm.fp8_gemm_nt(grad_output_fp8, weight_dx_fp8, grad_x_2d)
+            require_deep_gemm().fp8_gemm_nt(grad_output_fp8, weight_dx_fp8, grad_x_2d)
             grad_x = grad_x_2d.reshape(ctx.x_shape)
 
         if ctx.needs_input_grad[1]:
@@ -66,7 +61,7 @@ class _FP8BlockwiseMM(torch.autograd.Function):
             grad_output_t_fp8 = per_token_cast_to_fp8_tp_triton(grad_output_2d_padded, False, block_size)
             x_t_fp8 = per_token_cast_to_fp8_tp_triton(x_2d_padded, False, block_size)
             grad_weight_fp32 = torch.zeros_like(weight, dtype=torch.float32)
-            deep_gemm.fp8_gemm_nt(
+            require_deep_gemm().fp8_gemm_nt(
                 grad_output_t_fp8,
                 x_t_fp8,
                 grad_weight_fp32,

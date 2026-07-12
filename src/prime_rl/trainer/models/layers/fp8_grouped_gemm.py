@@ -1,13 +1,8 @@
 from __future__ import annotations
 
-try:
-    import deep_gemm
-except ImportError:
-    deep_gemm = None  # CPU-only environments don't ship deep_gemm; FP8 paths
-    # are GPU-only at runtime, so leaving the symbol None is safe — only the
-    # autograd Function bodies below actually call into it.
 import torch
 
+from prime_rl.trainer.models.layers.deep_gemm_backend import require_deep_gemm
 from prime_rl.trainer.models.kernels.fp8_utils import (
     GROUP_ALIGNMENT,
     build_grouped_layout,
@@ -53,7 +48,7 @@ def _compute_grad_weight(
         GROUP_ALIGNMENT,
     )
     grad_weight = torch.zeros(weight_shape, device=x.device, dtype=torch.float32)
-    deep_gemm.k_grouped_fp8_gemm_nt_contiguous(
+    require_deep_gemm().k_grouped_fp8_gemm_nt_contiguous(
         x_k_major,
         dy_k_major,
         grad_weight,
@@ -104,7 +99,7 @@ class _GroupedFP8Gemm(torch.autograd.Function):
             device=x.device,
             dtype=x.dtype,
         )
-        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+        require_deep_gemm().m_grouped_fp8_gemm_nt_contiguous(
             x_fp8,
             weight_fp8,
             out_padded,
@@ -187,7 +182,7 @@ class _GroupedFP8Gemm(torch.autograd.Function):
                 device=grad_output.device,
                 dtype=grad_output.dtype,
             )
-            deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+            require_deep_gemm().m_grouped_fp8_gemm_nt_contiguous(
                 dy_fp8,
                 weight_dx_fp8,
                 grad_x_padded,
