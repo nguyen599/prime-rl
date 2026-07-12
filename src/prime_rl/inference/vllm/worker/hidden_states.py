@@ -8,7 +8,12 @@ from typing import Any
 import torch
 from torch.nn import Module
 
-from prime_rl.transport.hidden_state_files import sweep_tensor_files, write_tensor_chunks_file
+from prime_rl.transport.hidden_state_codec import INT6_CODEC, encode_had_int6
+from prime_rl.transport.hidden_state_files import (
+    sweep_tensor_files,
+    write_int6_tensor_chunks_file,
+    write_tensor_chunks_file,
+)
 
 _CAPTURE_DTYPES = {
     "bfloat16": torch.bfloat16,
@@ -190,13 +195,34 @@ class HiddenStateScoringMixin:
                         )
                     if worker._prime_hidden_capture_is_primary_worker():
                         target_dtype = _CAPTURE_DTYPES[capture["dtype"]]
-                        chunk = (
-                            hidden_states[offset : offset + copy_len]
-                            .detach()
-                            .to(dtype=target_dtype, device="cpu")
-                            .contiguous()
-                        )
-                        capture["chunks"][start_pos] = chunk
+                        selected_positions = capture.get("selected_positions")
+                        if selected_positions is None:
+                            chunk = (
+                                hidden_states[offset : offset + copy_len]
+                                .detach()
+                                .to(dtype=target_dtype, device="cpu")
+                                .contiguous()
+                            )
+                            capture["chunks"][start_pos] = chunk
+                        else:
+                            positions = [
+                                position
+                                for position in selected_positions
+                                if start_pos <= position < start_pos + copy_len
+                            ]
+                            if positions:
+                                local_positions = torch.tensor(
+                                    [position - start_pos for position in positions],
+                                    device=hidden_states.device,
+                                    dtype=torch.long,
+                                )
+                                selected = hidden_states[offset : offset + copy_len].index_select(0, local_positions).detach()
+                                packed, scales = encode_had_int6(selected)
+                                capture["chunks"][start_pos] = (
+                                    torch.tensor(positions, dtype=torch.int32),
+                                    packed.cpu(),
+                                    scales.cpu(),
+                                )
                     handled_capture_req_ids.add(req_id)
                     if start_pos + copy_len >= target_len:
                         completed_capture_req_ids.add(req_id)
@@ -232,7 +258,14 @@ class HiddenStateScoringMixin:
         model_runner._get_prompt_logprobs_dict = wrapped_get_prompt_logprobs_dict
         model_runner._prime_hidden_capture_hook_installed = True
 
-    def prepare_hidden_state_capture(self, request_id: str, target_len: int, dtype: str = "bfloat16") -> None:
+    def prepare_hidden_state_capture(
+        self,
+        request_id: str,
+        target_len: int,
+        dtype: str = "bfloat16",
+        selected_positions: list[int] | None = None,
+        codec: str = "raw",
+    ) -> None:
         """Prepare the worker to capture hidden states from a normal vLLM prefill.
 
         The API server sends an internal generate request with ``prompt_logprobs``
@@ -247,6 +280,16 @@ class HiddenStateScoringMixin:
             raise ValueError(
                 f"unsupported hidden-state capture dtype {dtype!r}; expected one of {sorted(_CAPTURE_DTYPES)}"
             )
+        if codec not in {"raw", INT6_CODEC}:
+            raise ValueError(f"unsupported hidden-state codec {codec!r}")
+        if codec == INT6_CODEC:
+            if not selected_positions:
+                raise ValueError("compact INT6 hidden-state capture requires selected positions")
+            selected_positions = sorted({int(position) for position in selected_positions})
+            if selected_positions[0] < 0 or selected_positions[-1] >= target_len:
+                raise ValueError("selected hidden-state positions are outside the request")
+        elif selected_positions is not None:
+            raise ValueError("selected hidden-state positions currently require the INT6 codec")
         self._prime_hidden_capture_install_hook()
         state = self._prime_hidden_capture_state()
         if request_id in state:
@@ -258,6 +301,8 @@ class HiddenStateScoringMixin:
             "chunks": {},
             "seen_req_ids": set(),
             "runner_req_id": None,
+            "selected_positions": selected_positions,
+            "codec": codec,
         }
 
     def discard_hidden_state_capture(self, request_id: str) -> bool:
@@ -288,6 +333,45 @@ class HiddenStateScoringMixin:
             raise RuntimeError(
                 f"no hidden-state chunks captured for request {request_id!r}; seen_model_runner_req_ids={seen_req_ids}"
             )
+
+        codec = str(capture.get("codec", "raw"))
+        if codec == INT6_CODEC:
+            ordered_int6 = [chunk for _, chunk in sorted(chunks.items())]
+            captured_positions = [
+                int(position)
+                for positions, _, _ in ordered_int6
+                for position in positions.tolist()
+            ]
+            if captured_positions != list(capture["selected_positions"]):
+                raise RuntimeError(
+                    f"hidden-state capture for {request_id!r} selected rows mismatch: "
+                    f"captured={len(captured_positions)} expected={len(capture['selected_positions'])}"
+                )
+            if output_path is None:
+                raise RuntimeError("compact INT6 hidden states require filesystem transport")
+            ref = write_int6_tensor_chunks_file(
+                output_path,
+                ordered_int6,
+                logical_rows=target_len,
+                hidden_size=int(capture["expected_width"]),
+            )
+            self._prime_maybe_sweep_hidden_files(Path(output_path).parent)
+            return {
+                "transport": "filesystem",
+                "path": ref.path,
+                "dtype": ref.dtype,
+                "shape": ref.shape,
+                "offset": ref.offset,
+                "nbytes": ref.nbytes,
+                "codec": ref.codec,
+                "logical_rows": ref.logical_rows,
+                "positions_offset": ref.positions_offset,
+                "positions_nbytes": ref.positions_nbytes,
+                "packed_offset": ref.packed_offset,
+                "packed_nbytes": ref.packed_nbytes,
+                "scales_offset": ref.scales_offset,
+                "scales_nbytes": ref.scales_nbytes,
+            }
 
         ordered: list[torch.Tensor] = []
         expected = 0

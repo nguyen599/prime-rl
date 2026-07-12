@@ -81,7 +81,12 @@ class InferencePool(Protocol):
         ...
 
     async def score_hidden_states(
-        self, token_ids: list[int], dtype: str = "bfloat16", storage_dir: str | Path | None = None
+        self,
+        token_ids: list[int],
+        dtype: str = "bfloat16",
+        storage_dir: str | Path | None = None,
+        selected_positions: list[int] | None = None,
+        codec: str = "raw",
     ) -> EncodedTensor | TensorFileReference:
         """Prefill-score ``token_ids`` as teacher hidden states for full-vocab OPD."""
         ...
@@ -115,12 +120,23 @@ class PrefillScorer:
         token_ids: list[int],
         dtype: str = "bfloat16",
         storage_dir: str | Path | None = None,
+        selected_positions: list[int] | None = None,
+        codec: str = "raw",
     ) -> EncodedTensor | TensorFileReference:
         openai = self._get_openai(configs)
         async with self._hidden_semaphore:
+            await _wait_for_hidden_state_budget(storage_dir)
             retry_timeout = float(os.environ.get("PRIME_RL_PREFILL_HIDDEN_RETRY_TIMEOUT_SECONDS", "900"))
             if retry_timeout <= 0:
-                return await prefill_hidden_states(openai, model, token_ids, dtype=dtype, storage_dir=storage_dir)
+                return await prefill_hidden_states(
+                    openai,
+                    model,
+                    token_ids,
+                    dtype=dtype,
+                    storage_dir=storage_dir,
+                    selected_positions=selected_positions,
+                    codec=codec,
+                )
 
             retryable_errors = (APIConnectionError, APITimeoutError)
             retry_min = max(0.0, float(os.environ.get("PRIME_RL_PREFILL_HIDDEN_RETRY_MIN_SECONDS", "2")))
@@ -142,6 +158,8 @@ class PrefillScorer:
                             token_ids,
                             dtype=dtype,
                             storage_dir=storage_dir,
+                            selected_positions=selected_positions,
+                            codec=codec,
                         )
                     except retryable_errors as exc:
                         get_logger().warning(
@@ -240,7 +258,12 @@ class StaticInferencePool:
         return await self._scorer.score(self.train_clients, self.model_name, token_ids)
 
     async def score_hidden_states(
-        self, token_ids: list[int], dtype: str = "bfloat16", storage_dir: str | Path | None = None
+        self,
+        token_ids: list[int],
+        dtype: str = "bfloat16",
+        storage_dir: str | Path | None = None,
+        selected_positions: list[int] | None = None,
+        codec: str = "raw",
     ) -> EncodedTensor | TensorFileReference:
         return await self._scorer.score_hidden_states(
             self.train_clients,
@@ -248,6 +271,8 @@ class StaticInferencePool:
             token_ids,
             dtype=dtype,
             storage_dir=storage_dir,
+            selected_positions=selected_positions,
+            codec=codec,
         )
 
     async def stop(self) -> None:
@@ -677,12 +702,33 @@ async def prefill_logprobs(openai: AsyncOpenAI, model: str, token_ids: list[int]
     return flat
 
 
+async def _wait_for_hidden_state_budget(storage_dir: str | Path | None) -> None:
+    max_bytes = int(os.environ.get("PRIME_RL_HIDDEN_STATE_MAX_PENDING_BYTES", "0"))
+    if storage_dir is None or max_bytes <= 0:
+        return
+    root = Path(storage_dir)
+    poll_seconds = max(0.1, float(os.environ.get("PRIME_RL_HIDDEN_STATE_BUDGET_POLL_SECONDS", "2")))
+    while True:
+        try:
+            used_bytes = sum(path.stat().st_size for path in root.glob("*.prlhs"))
+        except OSError:
+            used_bytes = 0
+        if used_bytes < max_bytes:
+            return
+        get_logger().warning(
+            f"Teacher hidden-state budget reached: pending_bytes={used_bytes} max_bytes={max_bytes}; waiting"
+        )
+        await asyncio.sleep(poll_seconds)
+
+
 async def prefill_hidden_states(
     openai: AsyncOpenAI,
     model: str,
     token_ids: list[int],
     dtype: str = "bfloat16",
     storage_dir: str | Path | None = None,
+    selected_positions: list[int] | None = None,
+    codec: str = "raw",
 ) -> EncodedTensor | TensorFileReference:
     """Request teacher last hidden states from the Prime-RL vLLM worker extension.
 
@@ -691,6 +737,10 @@ async def prefill_hidden_states(
     """
     base = str(openai.base_url).rstrip("/").removesuffix("/v1")
     body: dict = {"model": model, "token_ids": token_ids, "dtype": dtype}
+    if codec != "raw":
+        body["codec"] = codec
+    if selected_positions is not None:
+        body["selected_positions"] = selected_positions
     if storage_dir is not None:
         root = Path(storage_dir)
         if not root.is_absolute():
@@ -715,6 +765,14 @@ async def prefill_hidden_states(
                 shape=[int(x) for x in payload["shape"]],
                 offset=int(payload["offset"]),
                 nbytes=int(payload["nbytes"]),
+                codec=str(payload.get("codec", "raw")),
+                logical_rows=int(payload["logical_rows"]) if payload.get("logical_rows") is not None else None,
+                positions_offset=int(payload.get("positions_offset", 0)),
+                positions_nbytes=int(payload.get("positions_nbytes", 0)),
+                packed_offset=int(payload.get("packed_offset", 0)),
+                packed_nbytes=int(payload.get("packed_nbytes", 0)),
+                scales_offset=int(payload.get("scales_offset", 0)),
+                scales_nbytes=int(payload.get("scales_nbytes", 0)),
             )
         except Exception as exc:
             raise RuntimeError(f"invalid filesystem hidden-state scorer response: {payload!r}") from exc

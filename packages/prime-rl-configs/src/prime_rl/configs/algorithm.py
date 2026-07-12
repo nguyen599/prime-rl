@@ -269,6 +269,11 @@ class OPDAlgoConfig(BaseAlgoConfig):
     """Shared directory visible at the same absolute path from the teacher,
     orchestrator, packer, and trainer. Required for filesystem transport."""
 
+    teacher_hidden_codec: Literal["raw", "had_int6_blk32"] = "raw"
+    """Filesystem representation for teacher hidden states. The compact codec
+    stores only rows that contribute to ref-KL and applies Hadamard-rotated
+    blockwise INT6 compression."""
+
     teacher: FrozenModelConfig
     """The teacher — an inline frozen hosted model (``name`` + ``base_url``)
     whose reverse KL the policy distills toward. Required, and necessarily a
@@ -285,6 +290,8 @@ class OPDAlgoConfig(BaseAlgoConfig):
                 raise ValueError("teacher_hidden_path is required for filesystem hidden-state transport")
             if not self.teacher_hidden_path.is_absolute():
                 raise ValueError("teacher_hidden_path must be an absolute shared-filesystem path")
+        if self.teacher_hidden_codec != "raw" and self.teacher_hidden_transport != "filesystem":
+            raise ValueError("compact teacher hidden codecs require filesystem transport")
         return self
 
 

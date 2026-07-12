@@ -45,6 +45,7 @@ distill_mode = "full_vocab_hidden"
 teacher_hidden_dtype = "bfloat16"
 teacher_hidden_transport = "filesystem"
 teacher_hidden_path = "/shared/prime-rl/teacher-hidden/run-001"
+teacher_hidden_codec = "had_int6_blk32"
 
 [orchestrator.algo.teacher]
 name = "/models/teacher"
@@ -137,6 +138,15 @@ orchestrator, training-batch msgpack, or packer process. The path must resolve
 to the same shared filesystem from all roles. The default remains `inline` for
 backward compatibility.
 
+With ``teacher_hidden_codec = "had_int6_blk32"``, the orchestrator derives the
+causally shifted positions of nonzero ``ref_kl_weights`` and asks the teacher
+to retain only those rows. The worker applies a deterministic signed Hadamard
+rotation and blockwise INT6 quantization before copying data to CPU. A
+4096-wide row uses 3328 bytes instead of 8192 BF16 bytes. Row positions are
+embedded in the file, so truncation and packing remain aligned. The trainer
+decodes compact rows in bounded chunks and scatters them into the aligned
+microbatch immediately before the forward pass.
+
 ## Current Limits
 
 Full-vocab OPD currently has conservative guards:
@@ -150,9 +160,9 @@ Full-vocab OPD currently has conservative guards:
 - The teacher LM-head tensor must be available as HF safetensors.
 - The student and teacher vocabularies must be aligned. Hidden sizes may differ
   as long as each hidden state matches its own LM head.
-- Hidden states are stored as float16, bfloat16, or float32 raw tensor bytes;
-  bfloat16 is the default. Filesystem transport removes the control-plane copy,
-  but there is no int6 hidden-state compression yet.
+- Raw hidden states can use float16, bfloat16, or float32. The optional
+  ``had_int6_blk32`` filesystem codec is restricted to power-of-two hidden
+  widths divisible by 32, including DeepSeek-V4-Flash's width 4096.
 - The default hook intentionally targets vLLM's private
   `_get_prompt_logprobs_dict()` boundary and fails at installation if that
   boundary disappears. Re-run the live parity validator after upgrading vLLM.
@@ -182,6 +192,14 @@ For long-context or high-concurrency runs, use filesystem transport. Inline
 transport base64-encodes the full tensor over HTTP and then copies it through
 the orchestrator and packer, which is suitable only for compatibility and
 small smoke tests.
+
+Set ``PRIME_RL_HIDDEN_STATE_MAX_PENDING_BYTES`` to bound producer files by
+actual bytes, for example ``137438953472`` for 128 GiB. Compact producer names
+remain present while rank-private hard links are queued and are removed only
+after trainer ranks map their batches, so the limit includes trainer backlog.
+``PRIME_RL_HIDDEN_STATE_BUDGET_POLL_SECONDS`` controls backpressure polling.
+``PRIME_RL_HIDDEN_STATE_DECODE_CHUNK_ROWS`` defaults to 512 and bounds INT6
+decode workspace.
 
 ### DeepSeek-V4 correctness invariant
 

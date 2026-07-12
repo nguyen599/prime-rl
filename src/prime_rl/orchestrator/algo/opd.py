@@ -66,11 +66,30 @@ class OPDAlgorithm(Algorithm):
                     if self.opd_config.teacher_hidden_transport == "filesystem"
                     else None
                 )
-                hidden = await pool.score_hidden_states(
-                    token_ids,
-                    dtype=self.opd_config.teacher_hidden_dtype,
-                    storage_dir=storage_dir,
-                )
+                selected_positions = None
+                if self.opd_config.teacher_hidden_codec != "raw":
+                    token_weights = sample.ref_kl_weights
+                    if token_weights is None:
+                        token_weights = [1.0 if value else 0.0 for value in sample.mask]
+                    # A causal hidden row at p predicts token p+1. Persist only
+                    # rows whose next token participates in the ref-KL loss.
+                    selected_positions = [
+                        token_index - 1
+                        for token_index, weight in enumerate(token_weights)
+                        if token_index > 0 and float(weight) != 0.0
+                    ]
+                    if not selected_positions:
+                        raise ValueError("full-vocab OPD sample has no selected ref-KL hidden-state rows")
+                score_kwargs = {
+                    "dtype": self.opd_config.teacher_hidden_dtype,
+                    "storage_dir": storage_dir,
+                }
+                if self.opd_config.teacher_hidden_codec != "raw":
+                    score_kwargs.update(
+                        selected_positions=selected_positions,
+                        codec=self.opd_config.teacher_hidden_codec,
+                    )
+                hidden = await pool.score_hidden_states(token_ids, **score_kwargs)
                 if isinstance(hidden, TensorFileReference):
                     sample.ref_hidden_states_file = hidden
                     sample.ref_hidden_states = None

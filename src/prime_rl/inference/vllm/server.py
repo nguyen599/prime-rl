@@ -167,6 +167,12 @@ async def prefill_hidden_states(request: Request):
     if not isinstance(token_ids, list):
         return JSONResponse({"error": "token_ids must be a list"}, status_code=400)
     dtype = data.get("dtype", "bfloat16")
+    codec = str(data.get("codec", "raw"))
+    if codec not in {"raw", "had_int6_blk32"}:
+        return JSONResponse({"error": f"unsupported hidden-state codec {codec!r}"}, status_code=400)
+    selected_positions = data.get("selected_positions")
+    if selected_positions is not None and not all(isinstance(position, int) for position in selected_positions):
+        return JSONResponse({"error": "selected_positions must be a list of integers"}, status_code=400)
     transport = str(data.get("transport", "inline")).strip().lower()
     if transport not in {"inline", "filesystem"}:
         return JSONResponse({"error": f"unsupported hidden-state transport {transport!r}"}, status_code=400)
@@ -180,6 +186,8 @@ async def prefill_hidden_states(request: Request):
     client = engine_client(request)
     backend = os.environ.get("PRIME_RL_HIDDEN_STATE_BACKEND", "hook").strip().lower()
     if backend in {"extractor", "vllm_extractor", "official_extractor"}:
+        if codec != "raw":
+            return JSONResponse({"error": "compact hidden-state codecs require the hook backend"}, status_code=400)
         return await prefill_hidden_states_with_extractor(
             request, token_ids, dtype, hidden_request_id, output_path=output_path
         )
@@ -189,7 +197,7 @@ async def prefill_hidden_states(request: Request):
     # real ForwardContext and attention metadata.
     await client.collective_rpc(
         "prepare_hidden_state_capture",
-        args=(hidden_request_id, len(token_ids), dtype),
+        args=(hidden_request_id, len(token_ids), dtype, selected_positions, codec),
     )
     capture_active = True
     try:

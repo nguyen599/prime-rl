@@ -115,6 +115,44 @@ def test_opd_filesystem_hidden_transport_keeps_payload_out_of_sample():
     )
 
 
+def test_opd_compact_hidden_transport_scores_only_ref_kl_positions():
+    config = _build(
+        type="opd",
+        teacher=FROZEN,
+        distill_mode="full_vocab_hidden",
+        teacher_hidden_transport="filesystem",
+        teacher_hidden_path="/shared/hidden",
+        teacher_hidden_codec="had_int6_blk32",
+    )
+    algo = OPDAlgorithm(config, MagicMock())
+    pool = MagicMock(spec=StaticInferencePool)
+    ref = TensorFileReference(
+        path="/shared/hidden/sample.prlhs",
+        dtype="bfloat16",
+        shape=[2, 4096],
+        offset=128,
+        nbytes=6656,
+        codec="had_int6_blk32",
+        logical_rows=6,
+    )
+    pool.score_hidden_states = AsyncMock(return_value=ref)
+    algo.teacher_pool = pool
+    algo._teacher_ready = True
+    sample = _make_sample()
+    sample.ref_kl_weights = [0.0, 0.0, 1.0, 0.0, 1.0, 0.0]
+    rollout = _make_rollout([sample])
+
+    asyncio.run(algo.score_rollout(rollout))
+
+    pool.score_hidden_states.assert_awaited_once_with(
+        sample.token_ids,
+        dtype="bfloat16",
+        storage_dir=Path("/shared/hidden"),
+        selected_positions=[1, 3],
+        codec="had_int6_blk32",
+    )
+
+
 def test_opd_setup_connects_teacher_without_waiting_for_readiness():
     config = _build(type="opd", teacher=FROZEN)
     algo = OPDAlgorithm(config, MagicMock())

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from prime_rl.trainer.utils import balanced_partition
+from prime_rl.transport.hidden_state_codec import INT6_CODEC
 from prime_rl.transport.hidden_state_files import copy_tensor_file_reference, slice_tensor_file_rows
 from prime_rl.transport.types import EncodedTensor, MicroBatch, RoutedExperts, TensorFileReference, TrainingSample
 
@@ -213,7 +214,9 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
             f"ref_hidden_states: {ref_hidden_states.shape}, input_ids: {len(input_ids)}"
         )
     if ref_hidden_state_files is not None:
-        assert sum(int(ref.shape[0]) for ref in ref_hidden_state_files) == len(input_ids), (
+        assert sum(
+            int(ref.logical_rows if ref.codec == INT6_CODEC else ref.shape[0]) for ref in ref_hidden_state_files
+        ) == len(input_ids), (
             f"ref_hidden_state_files: {[ref.shape for ref in ref_hidden_state_files]}, input_ids: {len(input_ids)}"
         )
     for stream_name, stream in (
@@ -391,7 +394,7 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
                         f"{ref.shape[1:]} != {ref_hidden_file_template.shape[1:]}"
                     )
                 ref_hidden_state_files.append(copy_tensor_file_reference(ref))
-                sample_rows += int(ref.shape[0])
+                sample_rows += int(ref.logical_rows if ref.codec == INT6_CODEC else ref.shape[0])
             if sample_rows != sample_len:
                 raise ValueError(
                     f"filesystem hidden-state rows {sample_rows} do not match packed sample length {sample_len}"
@@ -610,7 +613,10 @@ def _assert_token_arrays_aligned(micro_batch: MicroBatch) -> None:
             f"{micro_batch.ref_hidden_states.shape[0]} != {num_tokens} tokens"
         )
     if micro_batch.ref_hidden_state_files is not None:
-        file_rows = sum(int(ref.shape[0]) for ref in micro_batch.ref_hidden_state_files)
+        file_rows = sum(
+            int(ref.logical_rows if ref.codec == INT6_CODEC else ref.shape[0])
+            for ref in micro_batch.ref_hidden_state_files
+        )
         assert file_rows <= num_tokens, (
             f"filesystem ref_hidden_states misaligned after packing: {file_rows} > {num_tokens} tokens"
         )

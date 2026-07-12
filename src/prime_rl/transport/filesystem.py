@@ -6,6 +6,7 @@ from time import time
 
 from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.transport.base import MicroBatchReceiver, MicroBatchSender, TrainingBatchReceiver, TrainingBatchSender
+from prime_rl.transport.hidden_state_codec import INT6_CODEC
 from prime_rl.transport.hidden_state_files import copy_tensor_file_reference
 from prime_rl.transport.types import MicroBatch, TrainingBatch
 from prime_rl.utils.pathing import get_rollout_dir, get_step_path, sync_wait_for_path
@@ -157,7 +158,14 @@ class FileSystemMicroBatchSender(MicroBatchSender):
         # name keeps disk usage bounded while allowing each rank to unlink its
         # link immediately after mmap. Sources that could not be hard-linked
         # stay in place and are handled by the producer TTL sweep.
-        for source in linked_sources - unowned_sources:
+        retained_sources = {
+            Path(ref.source_path)
+            for micro_batches in micro_batch_grid
+            for micro_batch in micro_batches
+            for ref in (micro_batch.ref_hidden_state_files or [])
+            if ref.codec == INT6_CODEC and ref.source_path
+        }
+        for source in linked_sources - unowned_sources - retained_sources:
             try:
                 source.unlink(missing_ok=True)
             except OSError:
@@ -187,13 +195,19 @@ class FileSystemMicroBatchSender(MicroBatchSender):
                 except OSError as exc:
                     if exc.errno not in {errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP}:
                         raise
-                    # Cross-filesystem or unsupported hard links remain valid,
-                    # but the trainer must not unlink the shared producer path.
-                    private_refs.append(copy_tensor_file_reference(ref, unlink_after_read=False))
+                    # Cross-filesystem or unsupported hard links read the
+                    # producer path directly. Compact refs carry source_path so
+                    # the trainer removes it only after all readers map it.
+                    private_ref = copy_tensor_file_reference(ref, unlink_after_read=False)
+                    if ref.codec == INT6_CODEC:
+                        private_ref.source_path = str(source)
+                    private_refs.append(private_ref)
                     unowned_sources.add(source)
                 else:
                     private_ref = copy_tensor_file_reference(ref, unlink_after_read=True)
                     private_ref.path = str(target)
+                    if ref.codec == INT6_CODEC:
+                        private_ref.source_path = str(source)
                     private_refs.append(private_ref)
                     linked_sources.add(source)
                     link_count += 1

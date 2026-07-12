@@ -26,6 +26,15 @@ class TensorFileReference(msgspec.Struct, array_like=True, gc=False, omit_defaul
     offset: int
     nbytes: int
     unlink_after_read: bool = False
+    codec: str = "raw"
+    logical_rows: int | None = None
+    positions_offset: int = 0
+    positions_nbytes: int = 0
+    packed_offset: int = 0
+    packed_nbytes: int = 0
+    scales_offset: int = 0
+    scales_nbytes: int = 0
+    source_path: str | None = None
 
 
 # Routed experts are large per-token arrays. tolist() is too expensive, so we

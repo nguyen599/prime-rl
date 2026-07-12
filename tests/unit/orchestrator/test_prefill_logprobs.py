@@ -116,3 +116,40 @@ def test_prefill_hidden_states_inline_remains_backward_compatible():
         }
 
     asyncio.run(_run())
+
+
+def test_prefill_hidden_states_forwards_compact_codec_metadata(tmp_path):
+    async def _run():
+        fake_openai = _FakeOpenAIClient(
+            {
+                "transport": "filesystem",
+                "path": str(tmp_path / "teacher" / "compact.prlhs"),
+                "dtype": "bfloat16",
+                "shape": [2, 4096],
+                "offset": 128,
+                "nbytes": 6656,
+                "codec": "had_int6_blk32",
+                "logical_rows": 5,
+                "positions_offset": 128,
+                "positions_nbytes": 8,
+                "packed_offset": 136,
+                "packed_nbytes": 6144,
+                "scales_offset": 6280,
+                "scales_nbytes": 512,
+            }
+        )
+        result = await prefill_hidden_states(
+            fake_openai,
+            "teacher",
+            [1, 2, 3, 4, 5],
+            storage_dir=tmp_path / "teacher",
+            selected_positions=[1, 3],
+            codec="had_int6_blk32",
+        )
+
+        assert result.codec == "had_int6_blk32"
+        assert result.logical_rows == 5
+        assert fake_openai.calls[0]["body"]["selected_positions"] == [1, 3]
+        assert fake_openai.calls[0]["body"]["codec"] == "had_int6_blk32"
+
+    asyncio.run(_run())

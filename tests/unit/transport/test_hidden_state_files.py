@@ -6,11 +6,13 @@ import torch
 from prime_rl.trainer.batch import prepare_batch, prepare_sample
 from prime_rl.trainer.utils import build_bin_cost
 from prime_rl.transport.filesystem import FileSystemMicroBatchReceiver, FileSystemMicroBatchSender
+from prime_rl.transport.hidden_state_codec import INT6_CODEC, encode_had_int6
 from prime_rl.transport.hidden_state_files import (
     copy_tensor_file_reference,
     materialize_tensor_files,
     slice_tensor_file_rows,
     unlink_owned_tensor_files,
+    write_int6_tensor_chunks_file,
     write_tensor_chunks_file,
     write_tensor_file,
 )
@@ -195,3 +197,45 @@ def test_inline_bfloat16_hidden_states_still_support_truncation():
     assert micro_batch.ref_hidden_states.shape == [6, 3]
     restored = torch.frombuffer(bytearray(micro_batch.ref_hidden_states.data), dtype=torch.bfloat16).reshape(6, 3)
     torch.testing.assert_close(restored, values[:6])
+
+
+def test_compact_int6_selected_rows_survive_pack_truncate_and_cleanup(tmp_path: Path):
+    logical_rows = 8
+    values = torch.randn(3, 32, dtype=torch.bfloat16)
+    positions = torch.tensor([1, 4, 6], dtype=torch.int32)
+    packed, scales = encode_had_int6(values)
+    source = tmp_path / "compact.prlhs"
+    ref = write_int6_tensor_chunks_file(
+        source,
+        [(positions, packed, scales)],
+        logical_rows=logical_rows,
+        hidden_size=32,
+    )
+
+    sample = _sample(list(range(logical_rows)), ref)
+    grid = prepare_batch(
+        rollouts=[sample],
+        seq_len=6,
+        num_train_workers=1,
+        idxs=[0],
+        num_loras=1,
+        bin_cost=build_bin_cost(None),
+    )
+    compact_ref = grid[0][0].ref_hidden_state_files[0]
+    assert compact_ref.codec == INT6_CODEC
+    assert compact_ref.logical_rows == 6
+
+    output_dir = tmp_path / "trainer_output"
+    FileSystemMicroBatchSender(output_dir, data_world_size=1).send(grid)
+    assert source.exists(), "producer path must remain visible to byte-budget accounting"
+    received = FileSystemMicroBatchReceiver(output_dir, data_rank=0).receive()[0]
+    received_ref = received.ref_hidden_state_files[0]
+    restored = materialize_tensor_files([received_ref], expected_rows=6, unlink_owned=False)
+
+    assert restored.shape == (6, 32)
+    torch.testing.assert_close(restored[1], values[0], atol=0.25, rtol=0.15)
+    torch.testing.assert_close(restored[4], values[1], atol=0.25, rtol=0.15)
+    torch.testing.assert_close(restored[[0, 2, 3, 5]], torch.zeros((4, 32), dtype=torch.bfloat16))
+    unlink_owned_tensor_files([received_ref])
+    assert not source.exists()
+    assert not Path(received_ref.path).exists()
