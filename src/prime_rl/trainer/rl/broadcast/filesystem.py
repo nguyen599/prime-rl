@@ -14,13 +14,14 @@ from prime_rl.trainer.models import PreTrainedModelPrimeRL
 from prime_rl.trainer.rl.broadcast.base import WeightBroadcast
 from prime_rl.trainer.rl.broadcast.nccl import filter_state_dict_by_layers, preprocess_layer_quantized
 from prime_rl.trainer.runs import get_multi_run_manager
-from prime_rl.trainer.utils import maybe_clean
 from prime_rl.trainer.weights import (
     gather_weights_on_master,
     save_state_dict,
 )
 from prime_rl.trainer.world import get_world
 from prime_rl.transport.kernel_weights import save_kernel_weight_manifest, save_kernel_weight_shard
+from prime_rl.utils.logger import get_logger
+from prime_rl.utils.pathing import WEIGHT_APPLIED_MARKER, get_all_ckpt_steps
 from prime_rl.utils.utils import get_broadcast_dir, get_step_path
 from prime_rl.utils.vlm import get_layer_prefix
 
@@ -28,6 +29,25 @@ from prime_rl.utils.vlm import get_layer_prefix
 def _supports_kernel_weight_conversion(model: nn.Module) -> bool:
     """Return whether a model exposes the custom vLLM-kernel conversion contract."""
     return callable(getattr(model, "convert_layer_to_vllm_kernel", None))
+
+
+def _clean_applied_broadcasts(broadcast_dir: Path, current_step: int, interval_to_keep: int | None) -> None:
+    """Remove only old filesystem broadcasts acknowledged by inference."""
+    logger = get_logger()
+    for candidate_step in get_all_ckpt_steps(broadcast_dir):
+        if candidate_step >= current_step:
+            continue
+
+        candidate_path = get_step_path(broadcast_dir, candidate_step)
+        if interval_to_keep and candidate_step % interval_to_keep == 0:
+            logger.debug(f"Keeping path {candidate_path} (on ckpt interval)")
+            continue
+        if not (candidate_path / WEIGHT_APPLIED_MARKER).exists():
+            logger.debug(f"Keeping path {candidate_path} (not yet applied by inference)")
+            continue
+
+        logger.debug(f"Removing applied broadcast path {candidate_path}")
+        shutil.rmtree(candidate_path, ignore_errors=True)
 
 
 class FileSystemWeightBroadcast(WeightBroadcast):
@@ -180,8 +200,8 @@ class FileSystemWeightBroadcast(WeightBroadcast):
 
     def maybe_clean(self, interval_to_keep: int | None):
         for idx in self.multi_run_manager.used_idxs:
-            maybe_clean(
+            _clean_applied_broadcasts(
                 get_broadcast_dir(self.multi_run_manager.get_run_dir(idx)),
-                self.multi_run_manager.progress[idx].step - 1,
-                interval_to_keep,
+                current_step=self.multi_run_manager.progress[idx].step - 1,
+                interval_to_keep=interval_to_keep,
             )

@@ -12,7 +12,7 @@ from prime_rl.orchestrator.types import Policy, VersionObserver
 from prime_rl.utils.async_utils import safe_cancel
 from prime_rl.utils.client import InferencePool
 from prime_rl.utils.logger import format_time, get_logger
-from prime_rl.utils.pathing import get_broadcast_dir, get_step_path, wait_for_path
+from prime_rl.utils.pathing import WEIGHT_APPLIED_MARKER, get_broadcast_dir, get_step_path, wait_for_path
 from prime_rl.utils.utils import get_latest_ckpt_step
 
 
@@ -116,6 +116,11 @@ class WeightWatcher:
             self.last_update_weights_time = time.perf_counter() - t1
             self.update_count += 1
             get_logger().debug(f"Updated weights to step {next_step} in {format_time(self.last_update_weights_time)}")
+
+            # The trainer can run several packed steps ahead of inference. A positive
+            # acknowledgement prevents it from deleting a filesystem checkpoint while
+            # vLLM workers are still opening its shards.
+            (weights_path / WEIGHT_APPLIED_MARKER).touch()
 
             self.ckpt_step = next_step
             self.policy.version = next_step

@@ -5,6 +5,8 @@ from pathlib import Path
 
 from prime_rl.utils.logger import get_logger
 
+WEIGHT_APPLIED_MARKER = "APPLIED"
+
 
 def get_log_dir(output_dir: Path) -> Path:
     return output_dir / "logs"
