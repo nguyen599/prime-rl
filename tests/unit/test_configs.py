@@ -14,7 +14,7 @@ from prime_rl.configs.rl import RLConfig
 from prime_rl.configs.sft import SFTConfig
 from prime_rl.configs.trainer import ModelConfig as TrainerModelConfig
 from prime_rl.configs.trainer import TrainerConfig
-from prime_rl.utils.config import BaseConfig, cli
+from prime_rl.utils.config import BaseConfig, cli, to_toml_dict
 
 # All config config classes
 CONFIG_CLASSES = [
@@ -183,6 +183,22 @@ def test_opd_filesystem_hidden_transport_requires_absolute_shared_path():
     config = OPDAlgoConfig.model_validate({**base, "teacher_hidden_path": "/shared/hidden"})
     assert config.teacher_hidden_dtype == "bfloat16"
     assert config.teacher_hidden_path == Path("/shared/hidden")
+
+
+def test_to_toml_dict_roundtrips_explicit_none(tmp_path):
+    """An explicit None override survives the write/re-parse round-trip used by SLURM launches."""
+    config = cli(TrainerConfig, args=["--model.compile", "None", "--optim.max_norm", "None"])
+    assert config.model.compile is None
+    assert config.optim.max_norm is None
+
+    write_toml(tmp_path / "cfg.toml", to_toml_dict(config))
+    reloaded = cli(TrainerConfig, args=["@", str(tmp_path / "cfg.toml")])
+    assert reloaded.model.compile is None
+    assert reloaded.optim.max_norm is None
+    assert reloaded == config
+
+    # Unset None fields stay dropped, so defaults still resolve on re-parse
+    assert "max_steps" not in to_toml_dict(cli(TrainerConfig, args=[]))
 
 
 def test_env_algo_overrides_top_level():
