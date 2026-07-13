@@ -89,6 +89,21 @@ def test_capture_uses_vllm_chunk_offsets_and_preserves_unrelated_prompt_logprobs
     torch.testing.assert_close(restored, torch.cat([hidden[2:], hidden_tail]))
 
 
+def test_validation_capture_preserves_its_own_prompt_logprobs():
+    worker = _FakeWorker()
+    runner = worker.model_runner
+    worker.prepare_hidden_state_capture("capture", target_len=2, return_prompt_logprobs=True)
+    runner.input_batch = SimpleNamespace(req_ids=["capture"], req_id_to_index={"capture": 0})
+    runner.query_start_loc = SimpleNamespace(np=torch.tensor([0]))
+    runner.requests = {"capture": _request(2)}
+    runner.num_prompt_logprobs = {"capture": 1}
+
+    result = runner._get_prompt_logprobs_dict(torch.zeros((2, 4)), {"capture": 2})
+
+    assert result == {"capture": "original"}
+    assert runner.original_calls == [{"capture"}]
+
+
 def test_rewritten_request_id_binds_only_by_unique_prompt_length():
     worker = _FakeWorker()
     runner = worker.model_runner

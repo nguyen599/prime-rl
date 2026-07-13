@@ -735,12 +735,67 @@ async def prefill_hidden_states(
     The returned rows are aligned with ``token_ids`` and are consumed only by
     the opt-in full-vocab OPD trainer path.
     """
+    result, _ = await _prefill_hidden_states_request(
+        openai,
+        model,
+        token_ids,
+        dtype=dtype,
+        storage_dir=storage_dir,
+        selected_positions=selected_positions,
+        codec=codec,
+        return_prompt_logprobs=False,
+    )
+    return result
+
+
+async def prefill_hidden_states_with_prompt_logprobs(
+    openai: AsyncOpenAI,
+    model: str,
+    token_ids: list[int],
+    dtype: str = "bfloat16",
+    storage_dir: str | Path | None = None,
+    selected_positions: list[int] | None = None,
+    codec: str = "raw",
+) -> tuple[EncodedTensor | TensorFileReference, list[float | None]]:
+    """Capture hidden states and matching prompt logprobs from one teacher forward.
+
+    This is a validation-only path. Normal OPD scoring avoids prompt-logit
+    materialization and continues to use :func:`prefill_hidden_states`.
+    """
+    result, prompt_logprobs = await _prefill_hidden_states_request(
+        openai,
+        model,
+        token_ids,
+        dtype=dtype,
+        storage_dir=storage_dir,
+        selected_positions=selected_positions,
+        codec=codec,
+        return_prompt_logprobs=True,
+    )
+    if prompt_logprobs is None:
+        raise RuntimeError("hidden-state validation response omitted prompt_logprobs")
+    return result, prompt_logprobs
+
+
+async def _prefill_hidden_states_request(
+    openai: AsyncOpenAI,
+    model: str,
+    token_ids: list[int],
+    *,
+    dtype: str,
+    storage_dir: str | Path | None,
+    selected_positions: list[int] | None,
+    codec: str,
+    return_prompt_logprobs: bool,
+) -> tuple[EncodedTensor | TensorFileReference, list[float | None] | None]:
     base = str(openai.base_url).rstrip("/").removesuffix("/v1")
     body: dict = {"model": model, "token_ids": token_ids, "dtype": dtype}
     if codec != "raw":
         body["codec"] = codec
     if selected_positions is not None:
         body["selected_positions"] = selected_positions
+    if return_prompt_logprobs:
+        body["return_prompt_logprobs"] = True
     if storage_dir is not None:
         root = Path(storage_dir)
         if not root.is_absolute():
@@ -759,7 +814,7 @@ async def prefill_hidden_states(
     payload = http_response.json()
     if payload.get("transport") == "filesystem":
         try:
-            return TensorFileReference(
+            result = TensorFileReference(
                 path=str(payload["path"]),
                 dtype=str(payload["dtype"]),
                 shape=[int(x) for x in payload["shape"]],
@@ -776,10 +831,15 @@ async def prefill_hidden_states(
             )
         except Exception as exc:
             raise RuntimeError(f"invalid filesystem hidden-state scorer response: {payload!r}") from exc
-    try:
-        raw = base64.b64decode(payload["data"])
-        shape = [int(x) for x in payload["shape"]]
-        tensor_dtype = str(payload["dtype"])
-    except Exception as exc:
-        raise RuntimeError(f"invalid hidden-state scorer response: {payload!r}") from exc
-    return EncodedTensor(dtype=tensor_dtype, shape=shape, data=raw)
+    else:
+        try:
+            raw = base64.b64decode(payload["data"])
+            shape = [int(x) for x in payload["shape"]]
+            tensor_dtype = str(payload["dtype"])
+        except Exception as exc:
+            raise RuntimeError(f"invalid hidden-state scorer response: {payload!r}") from exc
+        result = EncodedTensor(dtype=tensor_dtype, shape=shape, data=raw)
+    prompt_logprobs = payload.get("prompt_logprobs")
+    if prompt_logprobs is not None:
+        prompt_logprobs = [None if value is None else float(value) for value in prompt_logprobs]
+    return result, prompt_logprobs

@@ -216,7 +216,9 @@ class HiddenStateScoringMixin:
                                     device=hidden_states.device,
                                     dtype=torch.long,
                                 )
-                                selected = hidden_states[offset : offset + copy_len].index_select(0, local_positions).detach()
+                                selected = (
+                                    hidden_states[offset : offset + copy_len].index_select(0, local_positions).detach()
+                                )
                                 packed, scales = encode_had_int6(selected)
                                 capture["chunks"][start_pos] = (
                                     torch.tensor(positions, dtype=torch.int32),
@@ -236,6 +238,9 @@ class HiddenStateScoringMixin:
                 removed_prompt_logprobs: dict[str, Any] = {}
                 if isinstance(num_prompt_logprobs, dict):
                     for req_id in handled_capture_req_ids:
+                        capture = bindings[req_id]
+                        if capture.get("return_prompt_logprobs", False):
+                            continue
                         if req_id in num_prompt_logprobs:
                             removed_prompt_logprobs[req_id] = num_prompt_logprobs.pop(req_id)
                 try:
@@ -265,6 +270,7 @@ class HiddenStateScoringMixin:
         dtype: str = "bfloat16",
         selected_positions: list[int] | None = None,
         codec: str = "raw",
+        return_prompt_logprobs: bool = False,
     ) -> None:
         """Prepare the worker to capture hidden states from a normal vLLM prefill.
 
@@ -303,6 +309,7 @@ class HiddenStateScoringMixin:
             "runner_req_id": None,
             "selected_positions": selected_positions,
             "codec": codec,
+            "return_prompt_logprobs": bool(return_prompt_logprobs),
         }
 
     def discard_hidden_state_capture(self, request_id: str) -> bool:
@@ -337,11 +344,7 @@ class HiddenStateScoringMixin:
         codec = str(capture.get("codec", "raw"))
         if codec == INT6_CODEC:
             ordered_int6 = [chunk for _, chunk in sorted(chunks.items())]
-            captured_positions = [
-                int(position)
-                for positions, _, _ in ordered_int6
-                for position in positions.tolist()
-            ]
+            captured_positions = [int(position) for positions, _, _ in ordered_int6 for position in positions.tolist()]
             if captured_positions != list(capture["selected_positions"]):
                 raise RuntimeError(
                     f"hidden-state capture for {request_id!r} selected rows mismatch: "

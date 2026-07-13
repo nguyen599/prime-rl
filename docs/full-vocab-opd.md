@@ -219,7 +219,11 @@ The server may keep prefix caching enabled globally. vLLM marks requests with
 `prompt_logprobs=1`; therefore the complete prompt is recomputed and no hidden
 prefix rows are omitted.
 
-Validate a live teacher after changing vLLM, model code, or quantization:
+Validate a live teacher after changing vLLM, model code, or quantization. The
+validator asks the hook to retain vLLM's own prompt logprobs for this request,
+so hidden reconstruction and engine logprobs come from the same forward. Normal
+OPD requests keep this validation flag disabled and do not materialize prompt
+logits:
 
 ```bash
 PYTHONPATH=src python tests/manual/validate_vllm_hidden_states.py \
@@ -228,10 +232,26 @@ PYTHONPATH=src python tests/manual/validate_vllm_hidden_states.py \
   --checkpoint /models/dpsk-v4-flash
 ```
 
-The validator captures hidden states, separately requests vLLM prompt
-logprobs, reconstructs sampled logits with `hidden @ head.weight.T`, and checks
-their numerical agreement. This is the production equivalent of Proof-Pilot's
-SGLang hidden-state validator.
+Also validate the production selected-row codec and filesystem transport:
+
+```bash
+PYTHONPATH=src python tests/manual/validate_vllm_hidden_states.py \
+  --base-url http://127.0.0.1:8001/v1 \
+  --model-name /models/dpsk-v4-flash \
+  --checkpoint /models/dpsk-v4-flash \
+  --transport filesystem \
+  --codec had_int6_blk32 \
+  --tokens 512 \
+  --positions 16
+```
+
+The raw check proves that the hook captures the exact LM-head input. The codec
+check additionally covers selected-row capture, signed-Hadamard INT6
+round-trip, filesystem transport, row scattering, and causal alignment. Use a
+token count larger than `max_num_batched_tokens` for an explicit live
+chunked-prefill check; that validation is intentionally expensive because vLLM
+must compute prompt logprobs for every chunk. This is the Prime-RL equivalent
+of Proof-Pilot's SGLang A/B hidden-state checks.
 
 Filesystem producer files are atomically written (`tmp` + rename). The
 filesystem microbatch sender hard-links each segment into the owning rank's

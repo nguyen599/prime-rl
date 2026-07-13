@@ -4,7 +4,7 @@ import json
 import httpx
 
 from prime_rl.transport.types import EncodedTensor, TensorFileReference
-from prime_rl.utils.client import prefill_hidden_states, prefill_logprobs
+from prime_rl.utils.client import prefill_hidden_states, prefill_hidden_states_with_prompt_logprobs, prefill_logprobs
 
 
 class _FakeOpenAIClient:
@@ -114,6 +114,25 @@ def test_prefill_hidden_states_inline_remains_backward_compatible():
             "token_ids": [1],
             "dtype": "bfloat16",
         }
+
+    asyncio.run(_run())
+
+
+def test_prefill_hidden_states_validation_returns_same_pass_logprobs():
+    async def _run():
+        fake_openai = _FakeOpenAIClient(
+            {
+                "dtype": "bfloat16",
+                "shape": [2, 2],
+                "data": "AAAAAAAAAAA=",
+                "prompt_logprobs": [None, -0.25],
+            }
+        )
+        result, prompt_logprobs = await prefill_hidden_states_with_prompt_logprobs(fake_openai, "teacher", [10, 11])
+
+        assert isinstance(result, EncodedTensor)
+        assert prompt_logprobs == [None, -0.25]
+        assert fake_openai.calls[0]["body"]["return_prompt_logprobs"] is True
 
     asyncio.run(_run())
 

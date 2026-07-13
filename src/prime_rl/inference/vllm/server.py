@@ -75,6 +75,34 @@ def models(request: Request) -> OpenAIServingModels:
     return request.app.state.openai_serving_models
 
 
+def _flatten_target_prompt_logprobs(prompt_logprobs: Any, token_ids: list[int]) -> list[float | None]:
+    """Extract each prompt token's own logprob from a vLLM RequestOutput."""
+    if prompt_logprobs is None or len(prompt_logprobs) != len(token_ids):
+        raise RuntimeError(
+            "hidden-state validation did not receive one prompt-logprob entry per token: "
+            f"got={None if prompt_logprobs is None else len(prompt_logprobs)} expected={len(token_ids)}"
+        )
+    flattened: list[float | None] = []
+    for index, (entry, token_id) in enumerate(zip(prompt_logprobs, token_ids, strict=True)):
+        if entry is None:
+            if index == 0:
+                flattened.append(None)
+                continue
+            raise RuntimeError(f"hidden-state validation is missing prompt logprob at token index {index}")
+        value = entry.get(token_id)
+        if value is None:
+            value = entry.get(str(token_id))
+        if value is None:
+            raise RuntimeError(
+                f"hidden-state validation prompt logprobs do not contain token {token_id} at index {index}"
+            )
+        logprob = value.logprob if hasattr(value, "logprob") else value.get("logprob")
+        if logprob is None:
+            raise RuntimeError(f"hidden-state validation logprob is missing at token index {index}")
+        flattened.append(float(logprob))
+    return flattened
+
+
 WORKER_EXTENSION_CLS = {
     "nccl": "prime_rl.inference.vllm.worker.nccl.NCCLWeightUpdateWorker",
     "filesystem": "prime_rl.inference.vllm.worker.filesystem.FileSystemWeightUpdateWorker",
@@ -181,11 +209,17 @@ async def prefill_hidden_states(request: Request):
         return JSONResponse({"error": "filesystem output_path must be absolute"}, status_code=400)
     if transport == "filesystem" and not output_path:
         return JSONResponse({"error": "filesystem transport requires output_path"}, status_code=400)
+    return_prompt_logprobs = bool(data.get("return_prompt_logprobs", False))
 
     hidden_request_id = f"prime-hidden-{uuid.uuid4().hex}"
     client = engine_client(request)
     backend = os.environ.get("PRIME_RL_HIDDEN_STATE_BACKEND", "hook").strip().lower()
     if backend in {"extractor", "vllm_extractor", "official_extractor"}:
+        if return_prompt_logprobs:
+            return JSONResponse(
+                {"error": "same-forward prompt-logprob validation requires the hook backend"},
+                status_code=400,
+            )
         if codec != "raw":
             return JSONResponse({"error": "compact hidden-state codecs require the hook backend"}, status_code=400)
         return await prefill_hidden_states_with_extractor(
@@ -197,9 +231,10 @@ async def prefill_hidden_states(request: Request):
     # real ForwardContext and attention metadata.
     await client.collective_rpc(
         "prepare_hidden_state_capture",
-        args=(hidden_request_id, len(token_ids), dtype, selected_positions, codec),
+        args=(hidden_request_id, len(token_ids), dtype, selected_positions, codec, return_prompt_logprobs),
     )
     capture_active = True
+    validation_prompt_logprobs = None
     try:
         sampling_params = SamplingParams(
             max_tokens=1,
@@ -208,13 +243,14 @@ async def prefill_hidden_states(request: Request):
             detokenize=False,
             prompt_logprobs=1,
         )
-        async for _ in client.generate(
+        async for output in client.generate(
             TokensPrompt(prompt_token_ids=token_ids),
             sampling_params,
             hidden_request_id,
             priority=data.get("priority", 0),
         ):
-            pass
+            if return_prompt_logprobs and output.prompt_logprobs is not None:
+                validation_prompt_logprobs = output.prompt_logprobs
 
         results = await client.collective_rpc("pop_hidden_state_capture", args=(hidden_request_id, output_path))
         capture_active = False
@@ -232,6 +268,13 @@ async def prefill_hidden_states(request: Request):
         result = results
     if result is None:
         return JSONResponse({"error": "hidden-state scorer returned no result"}, status_code=500)
+    if not isinstance(result, dict):
+        return JSONResponse(
+            {"error": f"hidden-state scorer returned an invalid result type: {type(result).__name__}"},
+            status_code=500,
+        )
+    if return_prompt_logprobs:
+        result["prompt_logprobs"] = _flatten_target_prompt_logprobs(validation_prompt_logprobs, token_ids)
     return result
 
 
