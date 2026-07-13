@@ -1,4 +1,4 @@
-"""Single-GPU forward/backward canary for MagiAttention OLMo3 sink adapters."""
+"""Single-GPU forward/backward canary for OLMo3 sink adapters."""
 
 from __future__ import annotations
 
@@ -10,6 +10,11 @@ from prime_rl.trainer.models.olmo3_sink.magi_sink import (
     magi_varlen_attention_with_sink,
     validate_magi_sink_backend,
 )
+from prime_rl.trainer.models.olmo3_sink.native_fa3_sink import (
+    NATIVE_FA3_SINK_ATTN_IMPL,
+    native_fa3_varlen_attention_with_sink,
+    validate_native_fa3_sink_backend,
+)
 
 
 def main() -> None:
@@ -19,7 +24,10 @@ def main() -> None:
     parser.add_argument("--sliding-window", type=int, default=64)
     args = parser.parse_args()
 
-    validate_magi_sink_backend(args.backend)
+    if args.backend == NATIVE_FA3_SINK_ATTN_IMPL:
+        validate_native_fa3_sink_backend()
+    else:
+        validate_magi_sink_backend(args.backend)
     torch.manual_seed(1234)
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -35,7 +43,7 @@ def main() -> None:
     max_seqlen = seq_len // 2
     window_size = (args.sliding_window - 1, 0) if args.sliding_window > 0 else (-1, -1)
 
-    out = magi_varlen_attention_with_sink(
+    common_args = (
         q,
         k,
         v,
@@ -44,11 +52,20 @@ def main() -> None:
         cu_seqlens,
         max_seqlen,
         max_seqlen,
-        attn_impl=args.backend,
-        softmax_scale=head_dim**-0.5,
-        causal=True,
-        window_size=window_size,
     )
+    common_kwargs = {
+        "softmax_scale": head_dim**-0.5,
+        "causal": True,
+        "window_size": window_size,
+    }
+    if args.backend == NATIVE_FA3_SINK_ATTN_IMPL:
+        out = native_fa3_varlen_attention_with_sink(*common_args, **common_kwargs)
+    else:
+        out = magi_varlen_attention_with_sink(
+            *common_args,
+            attn_impl=args.backend,
+            **common_kwargs,
+        )
     out.float().square().mean().backward()
 
     tensors = {"q": q, "k": k, "v": v, "sink": sink}

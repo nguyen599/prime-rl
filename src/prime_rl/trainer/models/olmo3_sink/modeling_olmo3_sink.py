@@ -41,7 +41,6 @@ from copy import copy
 import torch
 import torch.nn as nn
 from torch import Tensor
-
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import (
@@ -295,8 +294,10 @@ class Olmo3SinkAttention(Olmo3Attention):
 
         attn_impl = self.config._attn_implementation
         from .magi_sink import MAGI_SINK_ATTN_IMPLS
+        from .native_fa3_sink import NATIVE_FA3_SINK_ATTN_IMPL
 
-        if attn_impl != "eager" and attn_impl not in MAGI_SINK_ATTN_IMPLS:
+        sink_attn_impls = {*MAGI_SINK_ATTN_IMPLS, NATIVE_FA3_SINK_ATTN_IMPL}
+        if attn_impl != "eager" and attn_impl not in sink_attn_impls:
             raise ValueError(
                 "Olmo3Sink uses attention sinks (s_aux). Generic attention backends "
                 f"({attn_impl!r}) may silently ignore the sink argument. Load with "
@@ -522,12 +523,13 @@ class Olmo3SinkForCausalLM(Olmo3SinkPreTrainedModel, Olmo3ForCausalLM):
         self.post_init()
 
 
-# Auto-register MagiAttention sink adapters so `attn_implementation="olmo3_sink_fa*"`
-# works on import (including trust_remote_code). Kernel dependencies load lazily.
+# Auto-register MagiAttention and native FA3 sink adapters so
+# `attn_implementation="olmo3_sink_fa*"` works on import (including
+# trust_remote_code). Kernel dependencies load lazily.
 try:
-    from .attention import register_magi_sink_attentions
+    from .attention import register_sink_attentions
 
-    register_magi_sink_attentions()
+    register_sink_attentions()
 except Exception:  # noqa: BLE001
     pass
 

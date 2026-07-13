@@ -29,9 +29,9 @@ def register_olmo3_sink(exist_ok: bool = True) -> None:
     AutoConfig.register("olmo3_sink", Olmo3SinkConfig, exist_ok=exist_ok)
     AutoModel.register(Olmo3SinkConfig, Olmo3SinkModel, exist_ok=exist_ok)
     AutoModelForCausalLM.register(Olmo3SinkConfig, Olmo3SinkForCausalLM, exist_ok=exist_ok)
-    # Registration itself is dependency-free. The selected adapter imports Magi and
-    # its matching FA package lazily, then fails with an actionable error if absent.
-    from .attention import register_magi_sink_attentions
+    # Registration itself is dependency-free. The selected adapter imports Magi or
+    # the original FA3 sink package lazily, then fails with an actionable error.
+    from .attention import register_sink_attentions
 
-    register_magi_sink_attentions()
+    register_sink_attentions()
     _REGISTERED = True

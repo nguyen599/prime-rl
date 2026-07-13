@@ -9,6 +9,7 @@ Olmo3Sink is the OLMo3 training/inference path used for proof-reasoning experime
 | `src/prime_rl/trainer/models/olmo3_sink/configuration_olmo3_sink.py` | `Olmo3SinkConfig`, registered as `model_type = "olmo3_sink"`. |
 | `src/prime_rl/trainer/models/olmo3_sink/modeling_olmo3_sink.py` | Trainer-side model implementation with attention sinks and OLMo3 per-layer RoPE handling. |
 | `src/prime_rl/trainer/models/olmo3_sink/magi_sink.py` | Lazy FA2/FA3/FA4 dispatcher for MagiAttention's sink extensions. |
+| `src/prime_rl/trainer/models/olmo3_sink/native_fa3_sink.py` | Selectable adapter for the original custom-op-backed FA3 sink kernel. |
 | `src/prime_rl/trainer/models/olmo3_sink/vllm_adapter.py` | vLLM adapter with packed `qkv_proj`, packed `gate_up_proj`, and per-head sink loading. |
 | `src/prime_rl/trainer/models/olmo3_sink/converting_olmo3_sink.py` | Layer conversion for vLLM kernel-format weight transfer, including optional FP8 quantized transfer. |
 
@@ -35,9 +36,10 @@ Context parallelism (`cp`) is useful for long contexts on dense 32B models. The 
 |---|---|---|---|
 | `olmo3_sink_fa2` | Supported by the installed FA2 build | Yes | Default for standard OLMo3 mixed full/sliding layers. |
 | `olmo3_sink_fa3` | Hopper (SM90) | Yes | Uses Magi's FA3 sink extension. |
+| `olmo3_sink_fa3_native` | Hopper (SM90) | Yes | Uses Prime-RL's pre-Magi in-kernel FA3 path for parity/debug comparisons. |
 | `olmo3_sink_fa4` | Blackwell (SM100+) | No | Only valid when every model layer uses full attention. |
 
-All three paths preserve gradients to `self_attn.sinks`. Generic `flash_attention_*`
+All four paths preserve gradients to `self_attn.sinks`. Generic `flash_attention_*`
 names are rejected for Olmo3Sink because those interfaces can silently drop `s_aux`.
 Context parallel runs must use `cp_style = "ulysses"`; ring attention is not sink-aware.
 
@@ -64,7 +66,18 @@ Run a single-GPU kernel canary with:
 ```bash
 python tests/manual/olmo3_sink_magi_kernel.py --backend olmo3_sink_fa2
 python tests/manual/olmo3_sink_magi_kernel.py --backend olmo3_sink_fa3
+python tests/manual/olmo3_sink_magi_kernel.py --backend olmo3_sink_fa3_native
 ```
+
+The native FA3 backend deliberately remains separate from Magi's `olmo3_sink_fa3`:
+
+```toml
+[trainer.model]
+attn = "olmo3_sink_fa3_native"
+```
+
+This makes trainer-policy parity tests change only the attention implementation while
+leaving Magi installed and available for FA2/FA3/FA4 runs.
 
 Run the CP parity canary with:
 

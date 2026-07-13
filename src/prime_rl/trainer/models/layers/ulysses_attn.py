@@ -34,7 +34,12 @@ import torch.distributed.nn.functional as dist_nn
 # ring_flash_attn's DATA_PARAMS pattern so the patched attention path can
 # reach the *full* (un-sharded) cu_seqlens / max_seqlen at call time.
 ULYSSES_PARAMS: dict = {}
-OLMO3_SINK_ATTN_IMPLS = ("olmo3_sink_fa2", "olmo3_sink_fa3", "olmo3_sink_fa4")
+OLMO3_SINK_ATTN_IMPLS = (
+    "olmo3_sink_fa2",
+    "olmo3_sink_fa3",
+    "olmo3_sink_fa3_native",
+    "olmo3_sink_fa4",
+)
 
 
 def update_ulysses_params(cu_seqlens: torch.Tensor, max_seqlen: int) -> None:
@@ -146,7 +151,7 @@ def ulysses_olmo3_sink_attention_forward(
     s_aux: torch.Tensor | None = None,
     **kwargs,
 ):
-    """Ulysses wrapper for Olmo3Sink's MagiAttention sink interfaces.
+    """Ulysses wrapper for Olmo3Sink's Magi and native FA3 sink interfaces.
 
     Olmo3Sink registers its own ``olmo3_sink_fa*`` attention keys instead of using
     HF's ``flash_attention_2`` function. Without this registration, CP shards the
@@ -175,23 +180,43 @@ def ulysses_olmo3_sink_attention_forward(
     sink = _ulysses_local_head_slice(sink, cp_group, cp_size)
     window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
 
-    from prime_rl.trainer.models.olmo3_sink.magi_sink import magi_varlen_attention_with_sink
+    attn_impl = module.config._attn_implementation
+    if attn_impl == "olmo3_sink_fa3_native":
+        from prime_rl.trainer.models.olmo3_sink.native_fa3_sink import (
+            native_fa3_varlen_attention_with_sink,
+        )
 
-    out = magi_varlen_attention_with_sink(
-        q,
-        k,
-        v,
-        sink,
-        cu_seqlens,
-        cu_seqlens,
-        max_seqlen,
-        max_seqlen,
-        attn_impl=module.config._attn_implementation,
-        softmax_scale=scaling,
-        causal=True,
-        window_size=window_size,
-        dropout_p=dropout,
-    )
+        out = native_fa3_varlen_attention_with_sink(
+            q,
+            k,
+            v,
+            sink,
+            cu_seqlens,
+            cu_seqlens,
+            max_seqlen,
+            max_seqlen,
+            softmax_scale=scaling,
+            causal=True,
+            window_size=window_size,
+        )
+    else:
+        from prime_rl.trainer.models.olmo3_sink.magi_sink import magi_varlen_attention_with_sink
+
+        out = magi_varlen_attention_with_sink(
+            q,
+            k,
+            v,
+            sink,
+            cu_seqlens,
+            cu_seqlens,
+            max_seqlen,
+            max_seqlen,
+            attn_impl=attn_impl,
+            softmax_scale=scaling,
+            causal=True,
+            window_size=window_size,
+            dropout_p=dropout,
+        )
     out = _all_to_all_head_to_seq(out, cp_size, cp_group)
     return out.reshape(1, out.shape[0], out.shape[1], out.shape[2]), None
 
@@ -392,6 +417,8 @@ def substitute_hf_ulysses_attn(process_group: dist.ProcessGroup) -> None:
             from prime_rl.trainer.models.olmo3_sink import attention as olmo3_sink_attention
 
             olmo3_sink_attention.register_magi_sink_attentions = _register_ulysses_olmo3_sink_attentions
+            olmo3_sink_attention.register_native_fa3_sink_attention = _register_ulysses_olmo3_sink_attentions
+            olmo3_sink_attention.register_sink_attentions = _register_ulysses_olmo3_sink_attentions
             olmo3_sink_attention.register_fa3_sink_attention = _register_ulysses_olmo3_sink_attentions
         except Exception:
             pass

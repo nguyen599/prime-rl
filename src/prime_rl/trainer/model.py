@@ -508,9 +508,18 @@ def get_model(
     )
     model_config = coerce_olmo3_sink_config(model_config, config.attn)
     if config.attn.startswith("olmo3_sink_fa"):
-        from prime_rl.trainer.models.olmo3_sink.magi_sink import validate_magi_sink_backend
+        from prime_rl.trainer.models.olmo3_sink.magi_sink import MAGI_SINK_ATTN_IMPLS, validate_magi_sink_backend
+        from prime_rl.trainer.models.olmo3_sink.native_fa3_sink import (
+            NATIVE_FA3_SINK_ATTN_IMPL,
+            validate_native_fa3_sink_backend,
+        )
 
-        validate_magi_sink_backend(config.attn)
+        if config.attn in MAGI_SINK_ATTN_IMPLS:
+            validate_magi_sink_backend(config.attn)
+        elif config.attn == NATIVE_FA3_SINK_ATTN_IMPL:
+            validate_native_fa3_sink_backend()
+        else:
+            raise ValueError(f"Unknown OLMo3Sink attention backend: {config.attn!r}")
         if config.attn == "olmo3_sink_fa4" and "sliding_attention" in getattr(model_config, "layer_types", []):
             raise ValueError(
                 "olmo3_sink_fa4 cannot run OLMo3 sliding-attention layers because Magi's FA4 sink "

@@ -26,6 +26,7 @@ AttnImplementation: TypeAlias = Literal[
     "fa4",
     "olmo3_sink_fa2",
     "olmo3_sink_fa3",
+    "olmo3_sink_fa3_native",
     "olmo3_sink_fa4",
 ]
 EPCommBackend: TypeAlias = Literal["torch", "deepep"]
@@ -228,6 +229,7 @@ class ModelConfig(BaseModelConfig):
             "fa4",
             "olmo3_sink_fa2",
             "olmo3_sink_fa3",
+            "olmo3_sink_fa3_native",
             "olmo3_sink_fa4",
         }
         if self.cp > 1 and self.attn not in flash_attn_impls:

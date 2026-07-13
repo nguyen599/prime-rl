@@ -43,7 +43,12 @@ def test_olmo3_sink_ulysses_registration(monkeypatch):
     )
     monkeypatch.setattr(ulysses_attn.dist, "get_world_size", lambda group=None: 2)
 
-    sink_impls = ("olmo3_sink_fa2", "olmo3_sink_fa3", "olmo3_sink_fa4")
+    sink_impls = (
+        "olmo3_sink_fa2",
+        "olmo3_sink_fa3",
+        "olmo3_sink_fa3_native",
+        "olmo3_sink_fa4",
+    )
     originals = {name: ALL_ATTENTION_FUNCTIONS.get(name) for name in sink_impls}
     try:
         ulysses_attn.substitute_hf_ulysses_attn(MagicMock())
