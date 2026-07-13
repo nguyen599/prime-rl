@@ -69,6 +69,12 @@ python tests/manual/olmo3_sink_magi_kernel.py --backend olmo3_sink_fa3
 python tests/manual/olmo3_sink_magi_kernel.py --backend olmo3_sink_fa3_native
 ```
 
+On Hopper, compare the Magi and native FA3 forward/backward numerics directly:
+
+```bash
+python tests/manual/olmo3_sink_fa3_parity.py
+```
+
 The native FA3 backend deliberately remains separate from Magi's `olmo3_sink_fa3`:
 
 ```toml
