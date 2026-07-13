@@ -1,10 +1,21 @@
+import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+import torch
 from torch.nn import Module
+from vllm.logger import init_logger
 from vllm.model_executor.model_loader import DefaultModelLoader, get_model_loader
 
 from prime_rl.inference.vllm.worker.hidden_states import HiddenStateScoringMixin
-from prime_rl.inference.vllm.worker.weight_transfer import load_weights_checkpoint_layerwise
+from prime_rl.inference.vllm.worker.weight_transfer import (
+    load_weights_checkpoint_layerwise,
+    load_weights_kernel,
+    update_mla_absorbed_weights,
+)
+from prime_rl.transport.kernel_weights import has_kernel_weight_manifest, iter_kernel_weights
+
+logger = init_logger("vllm.inference.vllm.worker_filesystem")
 
 # This is to get type hints for the Worker class but not actually extend it at runtime as this is required by vLLM worker extension
 if TYPE_CHECKING:
@@ -36,6 +47,16 @@ class FileSystemWeightUpdateWorker(HiddenStateScoringMixin, Worker):
         else:
             model = model_runner.model
         assert isinstance(model, Module)
+
+        weight_dir = Path(weight_path)
+        if has_kernel_weight_manifest(weight_dir):
+            started = time.perf_counter()
+            logger.info("Reloading FP8 kernel-format weights with in-place copies")
+            load_weights_kernel(model, iter_kernel_weights(weight_dir))
+            update_mla_absorbed_weights(model)
+            torch.cuda.synchronize()
+            logger.info(f"Reloaded FP8 kernel-format weights in {time.perf_counter() - started:.2f}s")
+            return
 
         # Get vLLM model loader
         model_loader = get_model_loader(self.load_config)

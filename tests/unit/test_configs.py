@@ -401,6 +401,24 @@ def test_shared_seq_len_propagates_to_subconfigs():
     assert config.orchestrator.seq_len == 4096
 
 
+def test_filesystem_quantized_weight_transfer_propagates_to_trainer():
+    config = RLConfig.model_validate(
+        {
+            "trainer": {"model": {"impl": "custom"}},
+            "orchestrator": {"renderer": {"name": "default"}},
+            "inference": {},
+            "weight_broadcast": {"type": "filesystem", "quantize_in_weight_transfer": True},
+        }
+    )
+
+    assert config.trainer.weight_broadcast.type == "filesystem"
+    assert config.trainer.weight_broadcast.quantize_in_weight_transfer is True
+    assert config.orchestrator.weight_broadcast.type == "filesystem"
+    assert config.orchestrator.weight_broadcast.model_dump() == {"type": "filesystem"}
+    assert config.inference is not None
+    assert config.inference.weight_broadcast.model_dump() == {"type": "filesystem"}
+
+
 def test_shared_and_sub_seq_len_conflict_raises():
     """Setting seq_len at the shared level and on a sub-config is a conflict —
     forces the user to pick one place to express the value rather than

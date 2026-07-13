@@ -91,13 +91,33 @@ For vLLM inference, use vLLM quantization:
 quantization = "fp8"
 ```
 
-If NCCL quantized weight transfer is enabled, Olmo3Sink emits vLLM adapter names directly:
+If quantized weight transfer is enabled, Olmo3Sink emits vLLM adapter names directly:
 
 - `self_attn.qkv_proj.weight`
 - `self_attn.o_proj.weight`
 - `mlp.gate_up_proj.weight`
 - `mlp.down_proj.weight`
 - matching `*.weight_scale_inv` tensors for FP8 weights
+
+The same prepacked tensors can be transferred through NCCL or a shared filesystem:
+
+```toml
+[weight_broadcast]
+type = "filesystem"
+quantize_in_weight_transfer = true
+```
+
+For filesystem transfer, the trainer converts each layer once, writes FP8
+kernel-format safetensor shards, and publishes a manifest before the `STABLE`
+marker. Each policy worker detects that manifest and copies the tensors into the
+existing vLLM model in place. This avoids vLLM's checkpoint-format layerwise
+reload and per-worker FP8 re-quantization. With the option disabled, filesystem
+updates retain the original Hugging Face checkpoint reload behavior.
+
+This path requires `trainer.model.impl = "custom"`, a model implementation with
+`convert_layer_to_vllm_kernel`, and an FP8 vLLM policy model. It is intended for
+the current Olmo3Sink policy layout with inference TP=1; tensor-parallel policy
+workers require model-specific sharding support in the kernel loader.
 
 ## Current 4xH200 OPD Layout
 

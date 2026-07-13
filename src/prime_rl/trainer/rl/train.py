@@ -606,7 +606,9 @@ def train(config: TrainerConfig):
 
             # Add relevant tensors to tensor dict for logging purposes
             entropy = out["entropy"][loss_mask].detach().to("cpu")
-            tensors["entropy/all"].append(entropy)
+            has_entropy_tokens = entropy.numel() > 0
+            if has_entropy_tokens:
+                tensors["entropy/all"].append(entropy)
             tensors["loss"].append(loss.detach().to("cpu").unsqueeze(0))
 
             env_names = micro_batch["env_names"]
@@ -615,15 +617,16 @@ def train(config: TrainerConfig):
             for idx, env_name in enumerate(masked_env_names):
                 env_to_indices.setdefault(env_name, []).append(idx)
 
-            for env_name, indices in env_to_indices.items():
-                tensors[f"entropy/{env_name}"].append(entropy[indices])
+            if has_entropy_tokens:
+                for env_name, indices in env_to_indices.items():
+                    tensors[f"entropy/{env_name}"].append(entropy[indices])
 
             # Mismatch KL is only meaningful where sampling logprobs exist —
             # keep rl/ref_kl member tokens (policy-sampled), exclude tokens
             # whose action component is ce (frozen-model tokens).
             if rl_weights is None and ref_kl_weights is None:
                 mismatch_mask = loss_mask
-                has_mismatch_tokens = True
+                has_mismatch_tokens = bool(mismatch_mask.any())
             else:
                 sampled_mask = (rl_weights != 0) if rl_weights is not None else loss_mask
                 if ref_kl_weights is not None:
@@ -668,7 +671,14 @@ def train(config: TrainerConfig):
                 tensors[key].append(loss_tensor.detach().to("cpu").reshape(-1))
 
             # Debug log with *local, micro step* stats
-            micro_step_message = f"Micro Step {micro_step}/{len(micro_batches)} | Loss {tensors['loss'][-1].mean().item():.4f} | Entropy {tensors['entropy/all'][-1].mean().item():.4f}"
+            micro_step_message = (
+                f"Micro Step {micro_step}/{len(micro_batches)} | "
+                f"Loss {tensors['loss'][-1].mean().item():.4f} | "
+                f"Local Loss Tokens {int(loss_mask.sum())} | "
+                f"Entropy {entropy.mean().item():.4f}"
+                if has_entropy_tokens
+                else (f"Micro Step {micro_step}/{len(micro_batches)} | Loss n/a | Local Loss Tokens 0 | Entropy n/a")
+            )
             if has_mismatch_tokens:
                 micro_step_message += f" | Mismatch KL {tensors['mismatch_kl/all'][-1].mean().item():.4f}"
             if "max_vio" in tensors:

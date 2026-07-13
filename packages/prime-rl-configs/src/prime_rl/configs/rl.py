@@ -121,7 +121,10 @@ class SharedWeightBroadcastConfig(BaseConfig):
     """Timeout in seconds for NCCL weight broadcast."""
 
     quantize_in_weight_transfer: bool = False
-    """Use kernel-format FP8 quantized NCCL transfer for weight updates. When disabled, uses default HF checkpoint-format transfer."""
+    """Use kernel-format FP8 weights for NCCL or filesystem updates.
+
+    When disabled, both transports use the default HF checkpoint-format path.
+    """
 
 
 class BaseDeploymentConfig(BaseConfig):
@@ -298,9 +301,6 @@ class RLConfig(BaseConfig):
         if self.weight_broadcast is None or not self.weight_broadcast.quantize_in_weight_transfer:
             return self
 
-        if self.weight_broadcast.type != "nccl":
-            raise ValueError("weight_broadcast.quantize_in_weight_transfer requires weight_broadcast.type = 'nccl'.")
-
         if self.inference is None:
             raise ValueError("weight_broadcast.quantize_in_weight_transfer requires an inference config.")
 
@@ -364,7 +364,9 @@ class RLConfig(BaseConfig):
                 quantize_in_weight_transfer=self.weight_broadcast.quantize_in_weight_transfer,
             )
         elif self.weight_broadcast.type == "filesystem":
-            self.trainer.weight_broadcast = TrainerFileSystemWeightBroadcastConfig()
+            self.trainer.weight_broadcast = TrainerFileSystemWeightBroadcastConfig(
+                quantize_in_weight_transfer=self.weight_broadcast.quantize_in_weight_transfer,
+            )
             self.orchestrator.weight_broadcast = OrchestratorFileSystemWeightBroadcastConfig()
         if self.inference is not None:
             self.inference.weight_broadcast = InferenceWeightBroadcastConfig(type=self.weight_broadcast.type)

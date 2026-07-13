@@ -531,6 +531,9 @@ class FileSystemWeightBroadcastConfig(BaseWeightBroadcastConfig):
     save_format: Literal["safetensors", "torch"] = "safetensors"
     """Weight checkpoint serialization format."""
 
+    quantize_in_weight_transfer: bool = False
+    """Save vLLM kernel-format FP8 weights for in-place filesystem updates."""
+
 
 class NCCLWeightBroadcastConfig(BaseWeightBroadcastConfig):
     type: Literal["nccl"] = "nccl"
