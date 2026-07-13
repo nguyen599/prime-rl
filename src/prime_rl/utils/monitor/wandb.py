@@ -514,16 +514,10 @@ class WandbMonitor(Monitor):
                     "problem",
                     "proof_opd_trace",
                 ]
-                self.samples_table = wandb.Table(
-                    columns=self.samples_cols,
-                    log_mode="INCREMENTAL",
-                )
+                self.samples_table = wandb.Table(columns=self.samples_cols)
                 self.tokenizer = tokenizer
                 self.eval_samples_cols = ["step", "env", "task", "task_idx", "completion", "reward"]
-                self.eval_samples_table = wandb.Table(
-                    columns=self.eval_samples_cols,
-                    log_mode="INCREMENTAL",
-                )
+                self.eval_samples_table = wandb.Table(columns=self.eval_samples_cols)
 
     def _maybe_overwrite_wandb_command(self) -> None:
         """Overwrites sys.argv with the start command if it is set in the environment variables."""
@@ -549,7 +543,7 @@ class WandbMonitor(Monitor):
             return
         has_proof_opd_traces = any(_proof_opd_trace(rollout) for rollout in rollouts)
         force_proof_opd_trace_log = has_proof_opd_traces and os.environ.get(
-            "PRIME_WANDB_LOG_PROOF_OPD_TRACES", "1"
+            "PRIME_WANDB_FORCE_PROOF_OPD_TRACE_EVERY_STEP", "0"
         ).strip().lower() not in {"0", "false", "no", "off"}
         if (
             not self.config
@@ -575,6 +569,9 @@ class WandbMonitor(Monitor):
 
         self.logger.info(f"Logging {len(rollouts)} samples to W&B table at step {step}")
         start_time = time.perf_counter()
+        # A fresh table makes runs.summary["samples"] represent only this
+        # logging step instead of accumulating every earlier sample row.
+        self.samples_table = wandb.Table(columns=self.samples_cols)
 
         for rollout in rollouts:
             trace = rollout
@@ -621,6 +618,8 @@ class WandbMonitor(Monitor):
         ):
             return
 
+        # Keep only the latest eval step in runs.summary["eval/samples"].
+        self.eval_samples_table = wandb.Table(columns=self.eval_samples_cols)
         for rollout in rollouts:
             trace = rollout
             for branch in trace.branches:

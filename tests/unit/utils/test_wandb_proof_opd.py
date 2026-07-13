@@ -11,6 +11,7 @@ except ImportError:
     sys.modules["wandb_gql"] = wandb_gql
 
 from prime_rl.utils.monitor.wandb import (
+    WandbMonitor,
     _proof_opd_finish_reason,
     _proof_opd_problem,
     _proof_opd_stage,
@@ -18,6 +19,7 @@ from prime_rl.utils.monitor.wandb import (
     _proof_opd_token_counts,
     _proof_opd_trace,
 )
+from prime_rl.configs.shared import LogExtrasConfig, WandbWithExtrasConfig
 
 
 def _single_turn_rollout():
@@ -34,7 +36,8 @@ def _single_turn_rollout():
         mask=[False, False] + [True] * 30,
         finish_reason="length",
     )
-    task_data = {
+    task_record = {
+        "idx": 7,
         "answer": json.dumps(
             {
                 "problem": "Prove that the construction is cyclic.",
@@ -45,6 +48,7 @@ def _single_turn_rollout():
         "stage": "verify",
         "source_index": 7,
     }
+    task_data = SimpleNamespace(idx=7, model_dump=lambda mode="json": task_record)
     rollout = SimpleNamespace(
         env_name="proof_math",
         info={},
@@ -53,7 +57,7 @@ def _single_turn_rollout():
         branches=[],
         reward=0.0,
     )
-    branch = SimpleNamespace(nodes=[node])
+    branch = SimpleNamespace(nodes=[node], token_ids=[1, 2, 3])
     rollout.branches = [branch]
     return rollout, branch
 
@@ -97,3 +101,58 @@ def test_proof_opd_table_helpers_prefer_environment_info():
     assert _proof_opd_problem(rollout, trace) == "Choose the best proof."
     assert _proof_opd_finish_reason(rollout, branch) == "stop"
     assert _proof_opd_token_counts(rollout, branch)["total_tokens"] == 25
+
+
+def test_sample_table_logs_on_interval_and_replaces_previous_rows(monkeypatch):
+    rollout, _ = _single_turn_rollout()
+    logged = []
+
+    class FakeTable:
+        def __init__(self, columns):
+            self.columns = columns
+            self.data = []
+
+        def add_data(self, *values):
+            self.data.append(values)
+
+    monkeypatch.setattr("prime_rl.utils.monitor.wandb.wandb.Table", FakeTable)
+    monkeypatch.setattr("prime_rl.utils.monitor.wandb.wandb.log", lambda payload: logged.append(payload))
+
+    monitor = WandbMonitor.__new__(WandbMonitor)
+    monitor.is_master = True
+    monitor.config = WandbWithExtrasConfig(
+        log_extras=LogExtrasConfig(samples=True, distributions=False, interval=10, sample_ratio=1.0)
+    )
+    monitor.tokenizer = SimpleNamespace(decode=lambda token_ids: f"decoded:{len(token_ids)}")
+    monitor.logger = SimpleNamespace(info=lambda *_args, **_kwargs: None, debug=lambda *_args, **_kwargs: None)
+    monitor.last_log_samples_step = -1
+    monitor.samples_cols = [
+        "step",
+        "env_name",
+        "task",
+        "task_idx",
+        "messages",
+        "input_ids",
+        "reward",
+        "task_type",
+        "stage",
+        "token_counts",
+        "finish_reason",
+        "problem",
+        "proof_opd_trace",
+    ]
+    monitor.samples_table = FakeTable(monitor.samples_cols)
+
+    monitor.log_samples([rollout], step=1)
+    assert logged == []
+
+    monitor.log_samples([rollout], step=10)
+    step_10_table = logged[-1]["samples"]
+    assert len(step_10_table.data) == 1
+    assert step_10_table.data[0][0] == 10
+
+    monitor.log_samples([rollout], step=20)
+    step_20_table = logged[-1]["samples"]
+    assert step_20_table is not step_10_table
+    assert len(step_20_table.data) == 1
+    assert step_20_table.data[0][0] == 20
