@@ -229,7 +229,8 @@ logits:
 PYTHONPATH=src python tests/manual/validate_vllm_hidden_states.py \
   --base-url http://127.0.0.1:8001/v1 \
   --model-name /models/dpsk-v4-flash \
-  --checkpoint /models/dpsk-v4-flash
+  --checkpoint /models/dpsk-v4-flash \
+  --tokenizer /models/aligned-student-tokenizer
 ```
 
 Also validate the production selected-row codec and filesystem transport:
@@ -239,6 +240,7 @@ PYTHONPATH=src python tests/manual/validate_vllm_hidden_states.py \
   --base-url http://127.0.0.1:8001/v1 \
   --model-name /models/dpsk-v4-flash \
   --checkpoint /models/dpsk-v4-flash \
+  --tokenizer /models/aligned-student-tokenizer \
   --transport filesystem \
   --codec had_int6_blk32 \
   --tokens 512 \
@@ -248,10 +250,12 @@ PYTHONPATH=src python tests/manual/validate_vllm_hidden_states.py \
 The raw check proves that the hook captures the exact LM-head input. The codec
 check additionally covers selected-row capture, signed-Hadamard INT6
 round-trip, filesystem transport, row scattering, and causal alignment. Use a
-token count larger than `max_num_batched_tokens` for an explicit live
-chunked-prefill check; that validation is intentionally expensive because vLLM
-must compute prompt logprobs for every chunk. This is the Prime-RL equivalent
-of Proof-Pilot's SGLang A/B hidden-state checks.
+separate `--tokenizer` whenever the teacher server uses tokenizer files from an
+aligned student checkpoint; the validator must submit the same token IDs as
+production. Use a token count larger than `max_num_batched_tokens` for an
+explicit live chunked-prefill check; that validation is intentionally expensive
+because vLLM must compute prompt logprobs for every chunk. This is the Prime-RL
+equivalent of Proof-Pilot's SGLang A/B hidden-state checks.
 
 Filesystem producer files are atomically written (`tmp` + rename). The
 filesystem microbatch sender hard-links each segment into the owning rank's

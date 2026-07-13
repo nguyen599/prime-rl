@@ -57,7 +57,8 @@ def decode_hidden(encoded: EncodedTensor) -> torch.Tensor:
 
 
 async def validate(args: argparse.Namespace) -> None:
-    tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, trust_remote_code=True)
+    tokenizer_path = args.tokenizer or args.checkpoint
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
     token_ids = tokenizer.encode(args.prompt, add_special_tokens=False)
     if args.tokens > 0:
         if not token_ids:
@@ -142,6 +143,11 @@ def main() -> None:
     parser.add_argument("--api-key", default="EMPTY")
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--tokenizer",
+        type=Path,
+        help="Tokenizer served by vLLM; defaults to --checkpoint",
+    )
     parser.add_argument("--head-key", default="head.weight")
     parser.add_argument("--prompt", default="Prove that the sum of two even integers is even.")
     parser.add_argument("--tokens", type=int, default=0, help="Repeat and truncate the prompt to exactly this size")
