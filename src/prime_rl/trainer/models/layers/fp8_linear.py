@@ -5,14 +5,56 @@ import re
 import torch
 from torch import nn
 
-from prime_rl.trainer.models.layers.deep_gemm_backend import require_deep_gemm
 from prime_rl.trainer.models.kernels.fp8_utils import (
     per_block_cast_to_fp8_tp_triton,
     per_block_cast_to_fp8_triton,
     per_token_cast_to_fp8_tp_triton,
     per_token_cast_to_fp8_triton,
 )
+from prime_rl.trainer.models.layers.deep_gemm_backend import require_deep_gemm
 from prime_rl.utils.logger import get_logger
+
+FP8_WGRAD_MAX_REDUCTION_TOKENS = 32 * 1024
+
+
+def _fp8_weight_gradient(
+    x_2d: torch.Tensor,
+    grad_output_2d: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: int,
+    max_reduction_tokens: int = FP8_WGRAD_MAX_REDUCTION_TOKENS,
+) -> torch.Tensor:
+    """Compute FP8 dW in bounded token chunks with FP32 accumulation."""
+    if max_reduction_tokens < block_size or max_reduction_tokens % block_size != 0:
+        raise ValueError(
+            "max_reduction_tokens must be a positive multiple of the FP8 block size "
+            f"({block_size}), got {max_reduction_tokens}"
+        )
+
+    deep_gemm = require_deep_gemm()
+    grad_weight_fp32 = torch.zeros_like(weight, dtype=torch.float32)
+    num_tokens = grad_output_2d.size(0)
+    for start in range(0, num_tokens, max_reduction_tokens):
+        grad_output_chunk = grad_output_2d[start : start + max_reduction_tokens]
+        x_chunk = x_2d[start : start + max_reduction_tokens]
+        chunk_tokens = grad_output_chunk.size(0)
+        padded_tokens = (chunk_tokens + block_size - 1) // block_size * block_size
+        if padded_tokens != chunk_tokens:
+            pad_rows = padded_tokens - chunk_tokens
+            grad_output_chunk = torch.nn.functional.pad(grad_output_chunk, (0, 0, 0, pad_rows))
+            x_chunk = torch.nn.functional.pad(x_chunk, (0, 0, 0, pad_rows))
+
+        grad_output_t_fp8 = per_token_cast_to_fp8_tp_triton(grad_output_chunk, False, block_size)
+        x_t_fp8 = per_token_cast_to_fp8_tp_triton(x_chunk, False, block_size)
+        deep_gemm.fp8_gemm_nt(
+            grad_output_t_fp8,
+            x_t_fp8,
+            grad_weight_fp32,
+            c=grad_weight_fp32,
+            recipe=(1, 1, 128),
+        )
+
+    return grad_weight_fp32.to(weight.dtype)
 
 
 class _FP8BlockwiseMM(torch.autograd.Function):
@@ -46,29 +88,7 @@ class _FP8BlockwiseMM(torch.autograd.Function):
             grad_x = grad_x_2d.reshape(ctx.x_shape)
 
         if ctx.needs_input_grad[1]:
-            # deep_gemm.fp8_gemm_nt with recipe=(1, 1, 128) requires the K (token)
-            # dim to be a multiple of 128. Zero-pad along the token axis so non-
-            # aligned per-rank batches (from sequence packing) don't trip the kernel.
-            M_tok = grad_output_2d.size(0)
-            M_pad = (M_tok + block_size - 1) // block_size * block_size
-            if M_pad != M_tok:
-                pad_rows = M_pad - M_tok
-                grad_output_2d_padded = torch.nn.functional.pad(grad_output_2d, (0, 0, 0, pad_rows))
-                x_2d_padded = torch.nn.functional.pad(x_2d, (0, 0, 0, pad_rows))
-            else:
-                grad_output_2d_padded = grad_output_2d
-                x_2d_padded = x_2d
-            grad_output_t_fp8 = per_token_cast_to_fp8_tp_triton(grad_output_2d_padded, False, block_size)
-            x_t_fp8 = per_token_cast_to_fp8_tp_triton(x_2d_padded, False, block_size)
-            grad_weight_fp32 = torch.zeros_like(weight, dtype=torch.float32)
-            require_deep_gemm().fp8_gemm_nt(
-                grad_output_t_fp8,
-                x_t_fp8,
-                grad_weight_fp32,
-                c=grad_weight_fp32,
-                recipe=(1, 1, 128),
-            )
-            grad_weight = grad_weight_fp32.to(weight.dtype)
+            grad_weight = _fp8_weight_gradient(x_2d, grad_output_2d, weight, block_size)
 
         return grad_x, grad_weight, None, None
 
