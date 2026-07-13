@@ -97,7 +97,13 @@ If quantized weight transfer is enabled, Olmo3Sink emits vLLM adapter names dire
 - `self_attn.o_proj.weight`
 - `mlp.gate_up_proj.weight`
 - `mlp.down_proj.weight`
-- matching `*.weight_scale_inv` tensors for FP8 weights
+- matching scalar `*.weight_scale` tensors for FP8 weights
+
+The policy launcher uses vLLM's online per-tensor `quantization = "fp8"`
+method. During initial loading vLLM quantizes each HF `[N, K]` linear weight,
+stores the live kernel parameter as `[K, N]`, and keeps one scalar scale. The
+kernel-format exporter reproduces that live layout directly; it does not use
+the trainer's blockwise FP8 layout for policy weight transfer.
 
 The same prepacked tensors can be transferred through NCCL or a shared filesystem:
 

@@ -2,6 +2,22 @@ import torch
 from torch import Tensor
 
 
+def quantize_to_fp8_per_tensor(weight: Tensor) -> tuple[Tensor, Tensor]:
+    """Quantize a tensor with one FP8 e4m3 scale.
+
+    This matches vLLM's online ``quantization="fp8"`` linear layout before
+    the kernel-specific transpose: one floating-point scale for the complete
+    weight tensor.
+    """
+    if not weight.is_floating_point():
+        raise ValueError(f"FP8 quantization expects a floating-point tensor, got dtype={weight.dtype}")
+
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    scale = (weight.float().abs().max() / fp8_max).clamp(min=1e-12).reshape(1)
+    quantized = (weight.float() / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+    return quantized.contiguous(), scale.float().contiguous()
+
+
 def quantize_to_fp8_blockwise(weight: Tensor, block_size: int = 128) -> tuple[Tensor, Tensor]:
     """Quantize a 2D tensor to FP8 e4m3 with per-block scales."""
     if weight.ndim != 2:

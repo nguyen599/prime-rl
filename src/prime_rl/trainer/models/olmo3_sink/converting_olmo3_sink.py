@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from prime_rl.trainer.models.fp8 import quantize_to_fp8_blockwise
+from prime_rl.trainer.models.fp8 import quantize_to_fp8_per_tensor
 
 
 def convert_layer_to_vllm_kernel(
@@ -25,9 +25,13 @@ def convert_layer_to_vllm_kernel(
 
     def add_maybe_fp8(name: str, tensor: Tensor) -> None:
         if quantize_fp8 and tensor.ndim == 2:
-            fp8_weight, scale = quantize_to_fp8_blockwise(tensor)
-            out[name] = fp8_weight
-            out[name.removesuffix(".weight") + ".weight_scale_inv"] = scale
+            # vLLM's online ``quantization="fp8"`` path quantizes the HF
+            # [N, K] weight per tensor, then stores its live Cutlass kernel
+            # parameter as [K, N]. Kernel-format transfer bypasses that online
+            # processing, so emit the already-transposed live layout directly.
+            fp8_weight, scale = quantize_to_fp8_per_tensor(tensor)
+            out[name] = fp8_weight.transpose(0, 1).contiguous()
+            out[name.removesuffix(".weight") + ".weight_scale"] = scale
             return
         out[name] = tensor
 
