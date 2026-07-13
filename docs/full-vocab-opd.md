@@ -267,8 +267,23 @@ student tokenizer, BF16 hidden transport, and a 512-token prefill chunk limit:
   `6.70e-04` / `5.27e-03`.
 
 All errors compare same-forward vLLM prompt logprobs with
-`captured_hidden @ head.weight.T`. The INT6 mean remains below the SGLang
-reference validation threshold of `1e-3`.
+`captured_hidden @ head.weight.T`. Proof-Pilot's `1e-3` exact-tensor criterion
+applies to the raw BF16 check, not the deliberately lossy INT6 codec.
+
+The same checks also passed with `enforce_eager=false`, standard CUDA graphs,
+and vLLM compilation mode requested. This DeepSeek-V4 model class is not marked
+as supporting model-body `torch.compile` in the pinned vLLM, but vLLM captured
+its normal piecewise/full CUDA graphs:
+
+- raw inline, 12 rows: mean/max logprob error `1.69e-05` / `8.18e-05`;
+- raw filesystem, 128 rows: mean/max error `2.91e-06` / `1.48e-05`;
+- `had_int6_blk32` filesystem, 1,024 rows across two chunks: mean/max error
+  `2.45e-03` / `1.95e-02`.
+
+For this vLLM build, leaving `VLLM_USE_BREAKABLE_CUDAGRAPH` absent
+auto-enables breakable CUDA graphs for DeepSeek-V4 and disables the normal
+compilation pipeline. Set `VLLM_USE_BREAKABLE_CUDAGRAPH=0` explicitly to opt
+out; unsetting it is not an opt-out.
 
 Filesystem producer files are atomically written (`tmp` + rename). The
 filesystem microbatch sender hard-links each segment into the owning rank's
