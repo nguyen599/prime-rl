@@ -25,6 +25,11 @@ from prime_rl.utils.utils import get_broadcast_dir, get_step_path
 from prime_rl.utils.vlm import get_layer_prefix
 
 
+def _supports_kernel_weight_conversion(model: nn.Module) -> bool:
+    """Return whether a model exposes the custom vLLM-kernel conversion contract."""
+    return callable(getattr(model, "convert_layer_to_vllm_kernel", None))
+
+
 class FileSystemWeightBroadcast(WeightBroadcast):
     """Broadcast weights into the inference engine via shared filesystem."""
 
@@ -123,8 +128,11 @@ class FileSystemWeightBroadcast(WeightBroadcast):
 
     @torch.no_grad()
     def _broadcast_kernel_weights(self, model: nn.Module) -> None:
-        if not isinstance(model, PreTrainedModelPrimeRL):
-            raise ValueError("Kernel-format filesystem weight transfer requires a custom Prime-RL trainer model")
+        if not _supports_kernel_weight_conversion(model):
+            raise ValueError(
+                "Kernel-format filesystem weight transfer requires a trainer model that implements "
+                "convert_layer_to_vllm_kernel"
+            )
 
         ready_idxs = list(self.multi_run_manager.ready_to_update_idxs)
         save_dirs: dict[int, Path] = {}
