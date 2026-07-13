@@ -257,6 +257,19 @@ explicit live chunked-prefill check; that validation is intentionally expensive
 because vLLM must compute prompt logprobs for every chunk. This is the Prime-RL
 equivalent of Proof-Pilot's SGLang A/B hidden-state checks.
 
+DeepSeek-V4-Flash was validated on 2026-07-14 with TP=8 H200s and vLLM
+`f5a8d73377d0f0a4e00cba172f9fbd0d50471b07`. The teacher used the aligned
+student tokenizer, BF16 hidden transport, and a 512-token prefill chunk limit:
+
+- raw inline, 12 rows: mean/max logprob error `4.55e-05` / `2.91e-04`;
+- raw filesystem, 128 rows: mean/max error `1.75e-06` / `7.63e-06`;
+- `had_int6_blk32` filesystem, 1,024 rows across two chunks: mean/max error
+  `6.70e-04` / `5.27e-03`.
+
+All errors compare same-forward vLLM prompt logprobs with
+`captured_hidden @ head.weight.T`. The INT6 mean remains below the SGLang
+reference validation threshold of `1e-3`.
+
 Filesystem producer files are atomically written (`tmp` + rename). The
 filesystem microbatch sender hard-links each segment into the owning rank's
 step directory; the trainer removes that private link after mmap. Producer
