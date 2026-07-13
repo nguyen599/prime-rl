@@ -251,8 +251,89 @@ def _proof_opd_trace(rollout, branch=None) -> dict[str, Any]:
     return _fallback_proof_opd_trace(rollout, branch)
 
 
+def _proof_opd_info(rollout) -> dict[str, Any]:
+    info = getattr(rollout, "info", None)
+    return info if isinstance(info, dict) else {}
+
+
+def _proof_opd_task_type(rollout, trace: dict[str, Any]) -> str:
+    for payload in (_proof_opd_info(rollout), trace, _task_record(rollout), _task_answer_payload(rollout)):
+        task_type = str(payload.get("task_type") or "").strip()
+        if task_type:
+            return task_type
+    return ""
+
+
+def _proof_opd_problem(rollout, trace: dict[str, Any]) -> str:
+    for payload in (_proof_opd_info(rollout), trace, _task_record(rollout), _task_answer_payload(rollout)):
+        problem = payload.get("problem")
+        if problem is not None and str(problem).strip():
+            return _clip_proof_trace_text(problem)
+    return ""
+
+
+def _usage_count(usage: Any, key: str) -> int:
+    value = usage.get(key) if isinstance(usage, dict) else getattr(usage, key, 0)
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _proof_opd_token_counts(rollout, branch=None) -> dict[str, int]:
+    trace = _proof_opd_trace(rollout, branch)
+    for payload in (_proof_opd_info(rollout), trace):
+        counts = payload.get("token_counts")
+        if isinstance(counts, dict):
+            return {
+                key: _usage_count(counts, key)
+                for key in ("prompt_tokens", "generated_tokens", "reasoning_tokens", "total_tokens")
+            }
+
+    nodes = list(getattr(branch, "nodes", []) or [])
+    sampled_nodes = [node for node in nodes if bool(getattr(node, "sampled", False))]
+    prompt_tokens = generated_tokens = reasoning_tokens = total_tokens = 0
+    for node in sampled_nodes:
+        usage = getattr(node, "usage", None)
+        node_prompt = _usage_count(usage, "prompt_tokens")
+        node_generated = _usage_count(usage, "completion_tokens")
+        node_reasoning = _usage_count(usage, "reasoning_tokens")
+        node_total = _usage_count(usage, "total_tokens")
+        if node_generated == 0:
+            node_generated = sum(bool(value) for value in (getattr(node, "mask", None) or []))
+        if node_total == 0:
+            node_total = node_prompt + node_generated
+        prompt_tokens += node_prompt
+        generated_tokens += node_generated
+        reasoning_tokens += node_reasoning
+        total_tokens += node_total
+    return {
+        "prompt_tokens": prompt_tokens,
+        "generated_tokens": generated_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _proof_opd_finish_reason(rollout, branch=None) -> str:
+    trace = _proof_opd_trace(rollout, branch)
+    for payload in (_proof_opd_info(rollout), trace):
+        finish_reason = str(payload.get("finish_reason") or "").strip()
+        if finish_reason:
+            return finish_reason
+    nodes = list(getattr(branch, "nodes", []) or [])
+    for node in reversed(nodes):
+        if bool(getattr(node, "sampled", False)):
+            return str(getattr(node, "finish_reason", "") or "")
+    return ""
+
+
 def _proof_opd_stage(rollout, trace: dict[str, Any]) -> str:
     stage = str(trace.get("stage") or "").strip()
+    if stage:
+        return stage
+
+    stage = str(_proof_opd_info(rollout).get("stage") or "").strip()
     if stage:
         return stage
 
@@ -428,6 +509,9 @@ class WandbMonitor(Monitor):
                     "reward",
                     "task_type",
                     "stage",
+                    "token_counts",
+                    "finish_reason",
+                    "problem",
                     "proof_opd_trace",
                 ]
                 self.samples_table = wandb.Table(
@@ -507,8 +591,13 @@ class WandbMonitor(Monitor):
                     "messages": self.tokenizer.decode(token_ids),
                     "input_ids": str(token_ids),
                     "reward": trace.reward,
-                    "task_type": proof_trace.get("task_type", ""),
+                    "task_type": _proof_opd_task_type(rollout, proof_trace) if proof_trace else "",
                     "stage": _proof_opd_stage(rollout, proof_trace) if proof_trace else "",
+                    "token_counts": (
+                        _json_table_cell(_proof_opd_token_counts(rollout, branch)) if proof_trace else ""
+                    ),
+                    "finish_reason": _proof_opd_finish_reason(rollout, branch) if proof_trace else "",
+                    "problem": _proof_opd_problem(rollout, proof_trace) if proof_trace else "",
                     "proof_opd_trace": _json_table_cell(proof_trace) if proof_trace else "",
                 }
                 assert list(sample.keys()) == self.samples_cols, (
