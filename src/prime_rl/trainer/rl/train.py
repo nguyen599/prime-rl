@@ -2,6 +2,7 @@ import prime_rl._compat  # noqa: F401 — patch ring_flash_attn compat before im
 
 from contextlib import nullcontext
 import json
+import math
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -600,6 +601,60 @@ def train(config: TrainerConfig):
                 loss = loss + full_vocab_ref_kl_loss / ref_kl_scale
                 loss_tensors["ref_kl/full_vocab_ref_kl"] = out["full_vocab_ref_kl"].detach()
 
+            # Mismatch KL is only meaningful where sampling logprobs exist.
+            # Compute it before backward so a stale or corrupted rollout policy
+            # cannot apply a destructive optimizer update.
+            if rl_weights is None and ref_kl_weights is None:
+                mismatch_mask = loss_mask
+            else:
+                sampled_mask = (rl_weights != 0) if rl_weights is not None else loss_mask
+                if ref_kl_weights is not None:
+                    sampled_mask = sampled_mask | (ref_kl_weights != 0)
+                mismatch_mask = loss_mask & sampled_mask
+            has_mismatch_tokens = bool(mismatch_mask.any())
+            selected_mismatch_kl = None
+            if has_mismatch_tokens:
+                with torch.no_grad():
+                    _, _, mismatch_kl = compute_importance_ratio_and_mismatch_kl(
+                        out["logprobs"], inference_logprobs
+                    )
+                    selected_mismatch_kl = mismatch_kl[mismatch_mask]
+
+            mismatch_threshold = config.policy_mismatch_kl_abort_threshold
+            if mismatch_threshold is not None:
+                guard_stats = torch.zeros(3, dtype=torch.float64, device="cuda")
+                local_rank_mean = torch.tensor(float("-inf"), dtype=torch.float64, device="cuda")
+                if selected_mismatch_kl is not None:
+                    finite_mask = torch.isfinite(selected_mismatch_kl)
+                    finite_values = selected_mismatch_kl[finite_mask].to(torch.float64)
+                    guard_stats[0] = finite_values.sum()
+                    guard_stats[1] = finite_values.numel()
+                    guard_stats[2] = (~finite_mask).sum()
+                    if finite_values.numel() > 0:
+                        local_rank_mean = finite_values.mean()
+
+                dist.all_reduce(guard_stats, op=dist.ReduceOp.SUM, group=dp_cp_group)
+                dist.all_reduce(local_rank_mean, op=dist.ReduceOp.MAX, group=dp_cp_group)
+                global_count = int(guard_stats[1].item())
+                global_nonfinite = int(guard_stats[2].item())
+                global_mean = guard_stats[0].item() / global_count if global_count else float("nan")
+                max_rank_mean = local_rank_mean.item()
+                if global_nonfinite > 0 or (
+                    global_count > 0
+                    and (
+                        not math.isfinite(global_mean)
+                        or global_mean > mismatch_threshold
+                        or max_rank_mean > mismatch_threshold
+                    )
+                ):
+                    raise RuntimeError(
+                        "trainer-policy mismatch KL guard triggered before backward: "
+                        f"step={progress.step} micro_step={micro_step} "
+                        f"global_mean={global_mean:.6f} max_rank_mean={max_rank_mean:.6f} "
+                        f"nonfinite_tokens={global_nonfinite} threshold={mismatch_threshold:.6f}. "
+                        "Restart policy inference from the same checkpoint as the trainer and verify weight reloads."
+                    )
+
             # Backward pass
             with maybe_record_function("backward"):
                 loss.backward()
@@ -621,22 +676,8 @@ def train(config: TrainerConfig):
                 for env_name, indices in env_to_indices.items():
                     tensors[f"entropy/{env_name}"].append(entropy[indices])
 
-            # Mismatch KL is only meaningful where sampling logprobs exist —
-            # keep rl/ref_kl member tokens (policy-sampled), exclude tokens
-            # whose action component is ce (frozen-model tokens).
-            if rl_weights is None and ref_kl_weights is None:
-                mismatch_mask = loss_mask
-                has_mismatch_tokens = bool(mismatch_mask.any())
-            else:
-                sampled_mask = (rl_weights != 0) if rl_weights is not None else loss_mask
-                if ref_kl_weights is not None:
-                    sampled_mask = sampled_mask | (ref_kl_weights != 0)
-                mismatch_mask = loss_mask & sampled_mask
-                has_mismatch_tokens = bool(mismatch_mask.any())
-            if has_mismatch_tokens:
-                with torch.no_grad():
-                    _, _, mismatch_kl = compute_importance_ratio_and_mismatch_kl(out["logprobs"], inference_logprobs)
-                mismatch_kl = mismatch_kl[mismatch_mask].detach().to("cpu")
+            if selected_mismatch_kl is not None:
+                mismatch_kl = selected_mismatch_kl.detach().to("cpu")
                 tensors["mismatch_kl/all"].append(mismatch_kl)
                 mismatch_env_names = [
                     env_name for env_name, keep in zip(env_names, mismatch_mask.flatten().tolist()) if keep

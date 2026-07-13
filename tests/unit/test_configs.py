@@ -225,6 +225,15 @@ def test_trainer_enable_token_export_cli_flag():
     assert cli(TrainerConfig, args=["--enable-token-export"]).enable_token_export
 
 
+def test_trainer_policy_mismatch_kl_abort_threshold():
+    assert cli(TrainerConfig, args=[]).policy_mismatch_kl_abort_threshold is None
+    config = cli(TrainerConfig, args=["--policy-mismatch-kl-abort-threshold", "1.0"])
+    assert config.policy_mismatch_kl_abort_threshold == 1.0
+
+    with pytest.raises(ConfigFileError):
+        cli(TrainerConfig, args=["--policy-mismatch-kl-abort-threshold", "0"])
+
+
 def test_single_node_auto_inference_client_dp_rank_count_matches_local_dp():
     config = RLConfig.model_validate(
         {

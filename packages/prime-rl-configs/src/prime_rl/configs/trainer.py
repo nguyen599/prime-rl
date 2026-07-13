@@ -625,6 +625,14 @@ class TrainerConfig(BaseConfig):
     max_steps: int | None = None
     """Maximum number of training steps. If None, runs indefinitely."""
 
+    policy_mismatch_kl_abort_threshold: float | None = Field(None, gt=0)
+    """Abort before backward when trainer-policy mismatch KL exceeds this value.
+
+    The check runs on every microbatch and compares both the global token mean
+    and the largest trainer-rank token mean. ``None`` preserves the historical
+    behavior without an abort threshold.
+    """
+
     enable_router_replay: bool = False
     """Return routed experts in the batch so the trainer can replay routing. Requires ``enable_return_routed_experts=true`` on the vLLM server (or ``--enable-return-routed-experts``) and is only supported for custom models."""
 

@@ -68,6 +68,7 @@ A condensed view of the knobs you'll most often tune. For trainer-side paralleli
 | Knob | What it does |
 |---|---|
 | `log.level` | Process log level for trainer + orchestrator (`info` default; falls back to `$PRIME_LOG_LEVEL`). Set per-process via `trainer.log.level` / `orchestrator.log.level`, or globally on the `rl` entrypoint to propagate to both. |
+| `trainer.policy_mismatch_kl_abort_threshold` | Optional fail-fast threshold checked before every backward pass. It catches stale, partially reloaded, or corrupted inference policies before they update trainer weights. |
 | `orchestrator.log.vf_level` | Env-worker / [`verifiers`](https://github.com/PrimeIntellect-ai/verifiers) log level (`info` default; `debug` is noisy but useful for env debugging). |
 | `--wandb` (+ `--wandb.project`, `--wandb.name`) | Enable Weights & Biases logging. See [Weights & Biases](#weights--biases). |
 | `--orchestrator.prime-monitor` | Stream metrics to the Prime Intellect platform (Prime Lab). See [Platform monitoring](#platform-monitoring). |
@@ -124,6 +125,7 @@ Pulled from the console logs and mirrored to W&B.
 **Stability** (trainer):
 
 - `mismatch_kl/{all,env}/{mean,std,max}` — KL between trainer's current policy and the (older) inference policy that generated the rollouts. A sustained, growing mean is the early-warning sign for off-policy collapse.
+- A low version-0 mismatch does not validate weight transfer. Test at least one batch generated after a policy reload; set `max_off_policy_steps = 0` for a strict reload smoke.
 - `entropy/{all,env}/mean` — too low means mode-collapse; too high means the model isn't committing.
 - `masked_advantage_{positive,negative}/mean` — fraction of DPPO-masked tokens, split by sign.
 - `optim/grad_norm` — spikes precede divergence; check the loss config or lower the LR.
