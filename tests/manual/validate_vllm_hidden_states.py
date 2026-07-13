@@ -36,15 +36,22 @@ def load_head_weight(checkpoint: Path, key: str) -> torch.Tensor:
     if index_path.exists():
         weight_map = json.loads(index_path.read_text())["weight_map"]
         tensor_path = checkpoint / weight_map[key]
+        with safe_open(tensor_path, framework="pt", device="cpu") as handle:
+            if key not in handle.keys():
+                raise KeyError(f"{key!r} is not present in {tensor_path}")
+            weight = handle.get_tensor(key)
     else:
         candidates = sorted(checkpoint.glob("*.safetensors"))
         if not candidates:
             raise FileNotFoundError(f"no safetensors found under {checkpoint}")
-        tensor_path = candidates[0]
-    with safe_open(tensor_path, framework="pt", device="cpu") as handle:
-        if key not in handle.keys():
-            raise KeyError(f"{key!r} is not present in {tensor_path}")
-        weight = handle.get_tensor(key)
+        weight = None
+        for tensor_path in candidates:
+            with safe_open(tensor_path, framework="pt", device="cpu") as handle:
+                if key in handle.keys():
+                    weight = handle.get_tensor(key)
+                    break
+        if weight is None:
+            raise KeyError(f"{key!r} is not present in any safetensor shard under {checkpoint}")
     if weight.dim() != 2:
         raise ValueError(f"expected rank-2 LM-head weight, got {tuple(weight.shape)}")
     return weight.contiguous()
