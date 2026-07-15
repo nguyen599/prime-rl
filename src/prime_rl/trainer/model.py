@@ -327,6 +327,27 @@ torch._dynamo.config.recompile_limit = 16  # default: 8
 torch._dynamo.config.cache_size_limit = 64  # default: 8
 
 
+def isolate_compile_cache_for_rank() -> None:
+    """Give each torchrun worker its own compiler cache directory."""
+    if os.environ.get("PRIME_RL_ISOLATE_COMPILE_CACHE", "0").lower() not in {"1", "true", "yes"}:
+        return
+
+    rank = os.environ.get("RANK") or os.environ.get("LOCAL_RANK")
+    if rank is None:
+        return
+
+    rank_suffix = f"rank{rank}"
+    for env_name in ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR", "CUDA_CACHE_PATH"):
+        cache_root = os.environ.get(env_name)
+        if not cache_root:
+            continue
+        cache_path = Path(cache_root)
+        if cache_path.name != rank_suffix:
+            cache_path /= rank_suffix
+        cache_path.mkdir(parents=True, exist_ok=True)
+        os.environ[env_name] = str(cache_path)
+
+
 def freeze_vision_encoder(model: nn.Module, override_attr: str | None = None) -> None:
     logger = get_logger()
     vision_encoder = get_vision_encoder(model, override=override_attr)
@@ -1190,6 +1211,7 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
 
 
 def apply_compile(model: nn.Module, compile_config: CompileConfig):
+    isolate_compile_cache_for_rank()
     torch._dynamo.config.capture_scalar_outputs = True
     language_model = get_language_model(model)
     for layer_id in range(len(language_model.layers)):
