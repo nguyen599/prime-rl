@@ -102,6 +102,21 @@ def test_defaults():
     assert config.variant.alpha == 0.1
 
 
+def test_sft_external_multinode_does_not_require_slurm():
+    config = SFTConfig.model_validate(
+        {
+            "deployment": {
+                "type": "multi_node",
+                "launcher": "external",
+                "num_nodes": 8,
+                "nodes_per_fsdp_group": 1,
+            }
+        }
+    )
+
+    assert config.model.dp_replicate == 8
+
+
 def test_toml_partial_nested_override(tmp_path):
     """Partially overriding a nested model preserves unset field defaults."""
     write_toml(tmp_path / "cfg.toml", {"nested": {"lr": 3e-4}})

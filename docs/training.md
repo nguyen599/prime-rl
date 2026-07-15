@@ -150,6 +150,11 @@ Two accepted layouts:
 
 If both columns are present, `messages` takes precedence.
 
+`data.name` may also be a local `.parquet`, `.json`, `.jsonl`, or `.csv` file.
+Local files use the same schemas and loss masking as Hub datasets. Set
+`data.overflow_policy = "skip"` to discard examples that exceed `data.seq_len`
+after rendering; the default, `"truncate"`, preserves the historical behavior.
+
 **Tool definitions.** For tool-use SFT, add a `tools` column (OpenAI function-calling format) or `tool_defs` ([`verifiers`](https://github.com/PrimeIntellect-ai/verifiers) rollout format). Each row's value can be either a list of dicts or a JSON-encoded string of a list — both are accepted, and `tool_defs` rows are auto-converted to OAI shape before being passed into the chat template's `tools=...` argument. The `chat_template_kwargs` column, if present, is forwarded verbatim into `apply_chat_template`.
 
 **Position-dependent chat templates.** Multi-turn SFT under the default tokenization path (`build_incremental_token_mask`) requires that tokenizing the first _k_ turns of a conversation be a strict prefix of tokenizing all _n ≥ k_ turns. Qwen3's upstream template _violates_ this — it strips past `<think>` blocks across user turns, silently corrupting the loss mask. Two fixes:
@@ -169,13 +174,32 @@ uv run sft @ examples/reverse_text/sft.toml --wandb
 
 Multi-GPU and multi-node use torchrun under the hood (the `sft` entrypoint manages this for you — see [Scaling § SFT and Torchrun](scaling.md#sft-and-torchrun) for non-default layouts; multi-node SFT goes through [SLURM](scaling.md#slurm)).
 
+An external cluster launcher can run the trainer module directly. Set
+`deployment.type = "multi_node"`, `deployment.launcher = "external"`, and use
+the same resolved TOML on every rank:
+
+```bash
+torchrun \
+  --nnodes "$NUM_NODES" \
+  --nproc-per-node "$GPUS_PER_NODE" \
+  --node-rank "$NODE_RANK" \
+  --rdzv-endpoint "$MASTER_ADDR:$MASTER_PORT" \
+  -m prime_rl.trainer.sft.train @ /shared/config/sft.toml
+```
+
+`deployment.nodes_per_fsdp_group = 1` creates one FSDP island per node and
+replicates it across nodes (HSDP). This expert path bypasses the `sft`
+entrypoint's local/SLURM process launcher; checkpoint, output, and data paths
+must therefore be visible from every node.
+
 ### SFT-Specific Knobs
 
 | Knob | What it controls |
 |---|---|
 | `data.name` | HF dataset name or local path |
-| `data.batch_size` | Tokens per trainer step (packed) |
+| `data.batch_size` | Global number of packed `data.seq_len` sequences per optimizer step |
 | `data.seq_len` | Per-sample sequence length |
+| `data.overflow_policy` | `truncate` (default) or skip over-context examples before packing |
 | `loss_mask.*` | Which roles contribute to loss (system / user / assistant / tool). |
 | `val.interval` | Run validation every N steps; `val.data` mirrors `data` |
 

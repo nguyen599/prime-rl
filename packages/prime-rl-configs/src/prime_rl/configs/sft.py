@@ -96,6 +96,9 @@ class SFTDataConfig(BaseDataConfig):
     seed: int = 0
     """Random seed for shuffling. Re-shuffled per epoch by adding the epoch count to the seed."""
 
+    overflow_policy: Literal["truncate", "skip"] = "truncate"
+    """How to handle examples longer than ``seq_len`` before packing."""
+
     # Configuring
     loss_mask: LossMaskConfig = LossMaskConfig()
     """Which message types contribute to the loss."""
@@ -160,6 +163,9 @@ class MultiNodeDeploymentConfig(BaseDeploymentConfig):
 
     nodes_per_fsdp_group: int | None = None
     """Nodes per FSDP island. Auto-sets ``model.dp_replicate = num_nodes / nodes_per_fsdp_group``."""
+
+    launcher: Literal["slurm", "external"] = "slurm"
+    """Multi-node launcher. ``external`` accepts an already-created torchrun world."""
 
 
 SFTDeploymentConfig: TypeAlias = Annotated[
@@ -267,7 +273,11 @@ class SFTConfig(BaseConfig):
 
     @model_validator(mode="after")
     def validate_deployment(self):
-        if self.deployment.type == "multi_node" and self.slurm is None:
+        if (
+            self.deployment.type == "multi_node"
+            and self.deployment.launcher != "external"
+            and self.slurm is None
+        ):
             raise ValueError("Must use SLURM for multi-node deployment.")
         return self
 

@@ -29,6 +29,53 @@ def test_raise_error_if_no_prompt_and_completion(build_dummy_dataset):
         next(iter(sft_dataset))
 
 
+class _StableChatTokenizer:
+    eos_token_id = 2
+
+    def apply_chat_template(self, messages, *, add_generation_prompt=False, **_kwargs):
+        token_ids = [0]
+        for message in messages:
+            role = message["role"]
+            token_ids.append({"user": 10, "assistant": 11}[role])
+            token_ids.extend([20] * len(message.get("content", "")))
+            if role == "assistant":
+                token_ids.append(self.eos_token_id)
+        if add_generation_prompt:
+            token_ids.append(11)
+        return token_ids
+
+
+def test_skip_overflow_examples_before_packing():
+    dataset = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "too long"},
+                    {"role": "assistant", "content": "also too long"},
+                ]
+            },
+            {
+                "messages": [
+                    {"role": "user", "content": "x"},
+                    {"role": "assistant", "content": "y"},
+                ]
+            },
+        ]
+    )
+    sft_dataset = SFTDataset(
+        dataset,
+        tokenizer=_StableChatTokenizer(),
+        shuffle=False,
+        seq_len=6,
+        overflow_policy="skip",
+    )
+
+    sample = next(iter(sft_dataset))
+
+    assert len(sample["input_ids"]) == 5
+    assert sum(sample["loss_mask"]) > 0
+
+
 @pytest.mark.parametrize("max_epochs", [1, 2, 4])
 def test_sft_first_exhausted(build_dummy_dataset, max_epochs: int):
     a = build_dummy_dataset("a", 1)

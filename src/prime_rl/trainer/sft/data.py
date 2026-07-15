@@ -1,6 +1,7 @@
 import json
 import uuid
 from collections import defaultdict
+from pathlib import Path
 from typing import Literal, TypedDict, cast
 
 import torch
@@ -129,6 +130,7 @@ class SFTDataset(StatefulIterableDataset):
         max_examples: int | None = None,
         max_epochs: int | None = None,
         renderer: Renderer | None = None,
+        overflow_policy: Literal["truncate", "skip"] = "truncate",
     ):
         super().__init__()
         self.logger = get_logger()
@@ -142,6 +144,7 @@ class SFTDataset(StatefulIterableDataset):
         self.max_examples = max_examples
         self.max_epochs = max_epochs
         self.renderer = renderer
+        self.overflow_policy = overflow_policy
         self._warned_chat_template_kwargs = False
 
         if self.tokenizer is None:
@@ -270,6 +273,13 @@ class SFTDataset(StatefulIterableDataset):
             )
             input_ids.append(cast(int, self.tokenizer.eos_token_id))
             loss_mask.append(True)
+
+        if self.overflow_policy == "skip" and len(input_ids) - 1 > self.seq_len:
+            self.logger.warning(
+                f"Skipping example {example.get('__index', '')} because its tokenized length "
+                f"({len(input_ids) - 1}) exceeds the context window ({self.seq_len})"
+            )
+            return None
 
         # Prepare inputs
         target_ids = input_ids.copy()[1:]
@@ -517,7 +527,28 @@ def setup_and_interleave_datasets(
     datasets = []
     for subset, split in subsets_and_splits:
         logger.debug(f"Loading dataset {dataset_name} with {subset=} and {split=}")
-        dataset = cast(Dataset, load_dataset(dataset_name, subset, split=split))
+        local_path = Path(dataset_name).expanduser()
+        if local_path.is_file():
+            if subset is not None:
+                raise ValueError("Local SFT data files do not support dataset subsets")
+            builder_by_suffix = {
+                ".parquet": "parquet",
+                ".json": "json",
+                ".jsonl": "json",
+                ".csv": "csv",
+            }
+            builder = builder_by_suffix.get(local_path.suffix.lower())
+            if builder is None:
+                raise ValueError(
+                    f"Unsupported local SFT data file extension {local_path.suffix!r}; "
+                    "expected .parquet, .json, .jsonl, or .csv"
+                )
+            dataset = cast(
+                Dataset,
+                load_dataset(builder, data_files={split: str(local_path)}, split=split),
+            )
+        else:
+            dataset = cast(Dataset, load_dataset(dataset_name, subset, split=split))
         num_examples = len(dataset)
         dataset = dataset.add_column("__subset", [subset] * num_examples, new_fingerprint=str(uuid.uuid4()))
         dataset = dataset.add_column("__split", [split] * num_examples, new_fingerprint=str(uuid.uuid4()))
@@ -600,6 +631,7 @@ def setup_dataset(
             non_dp_size=non_dp_size,
             max_epochs=max_epochs,
             renderer=renderer,
+            overflow_policy=config.overflow_policy,
         )
     else:
         raise ValueError(f"Invalid dataset type: {config.type}")
