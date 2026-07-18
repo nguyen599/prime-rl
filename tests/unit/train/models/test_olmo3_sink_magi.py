@@ -35,7 +35,7 @@ def test_magi_backend_dispatch(monkeypatch, attn_impl, function_name):
 
     q = torch.empty(4, 2, 8)
     cu = torch.tensor([0, 4], dtype=torch.int32)
-    window = (-1, -1) if attn_impl == "olmo3_sink_fa4" else (31, 0)
+    window = (31, 0)
     out = magi_sink.magi_varlen_attention_with_sink(
         q,
         q,
@@ -55,27 +55,4 @@ def test_magi_backend_dispatch(monkeypatch, attn_impl, function_name):
     assert flash_fn.call_args.kwargs["sink"].shape == (1, 2)
     assert flash_fn.call_args.kwargs["sink"].dtype == torch.float32
     assert flash_fn.call_args.kwargs["sink_layout"] == "sh"
-
-
-def test_fa4_rejects_sliding_window(monkeypatch):
-    magi_sink = _load_magi_sink_module()
-    fake_module = SimpleNamespace(fa4_varlen_func_with_sink=MagicMock(), is_fa4_installed=True)
-    monkeypatch.setattr(magi_sink, "import_module", lambda name: fake_module)
-    q = torch.empty(4, 2, 8)
-    cu = torch.tensor([0, 4], dtype=torch.int32)
-
-    with pytest.raises(ValueError, match="does not support sliding-window"):
-        magi_sink.magi_varlen_attention_with_sink(
-            q,
-            q,
-            q,
-            torch.empty(2),
-            cu,
-            cu,
-            4,
-            4,
-            attn_impl="olmo3_sink_fa4",
-            softmax_scale=None,
-            causal=True,
-            window_size=(31, 0),
-        )
+    assert flash_fn.call_args.kwargs["window_size"] == window

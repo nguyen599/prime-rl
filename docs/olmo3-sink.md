@@ -37,7 +37,7 @@ Context parallelism (`cp`) is useful for long contexts on dense 32B models. The 
 | `olmo3_sink_fa2` | Supported by the installed FA2 build | Yes | Default for standard OLMo3 mixed full/sliding layers. |
 | `olmo3_sink_fa3` | Hopper (SM90) | Yes | Uses Magi's FA3 sink extension. |
 | `olmo3_sink_fa3_native` | Hopper (SM90) | Yes | Uses Prime-RL's pre-Magi in-kernel FA3 path for parity/debug comparisons. |
-| `olmo3_sink_fa4` | Blackwell (SM100+) | No | Only valid when every model layer uses full attention. |
+| `olmo3_sink_fa4` | Hopper/Blackwell (SM90/100/110/120) | Yes | Uses Magi's FA4 sink extension with FA4 local-window forward/backward support. |
 
 All four paths preserve gradients to `self_attn.sinks`. Generic `flash_attention_*`
 names are rejected for Olmo3Sink because those interfaces can silently drop `s_aux`.
@@ -67,6 +67,7 @@ Run a single-GPU kernel canary with:
 python tests/manual/olmo3_sink_magi_kernel.py --backend olmo3_sink_fa2
 python tests/manual/olmo3_sink_magi_kernel.py --backend olmo3_sink_fa3
 python tests/manual/olmo3_sink_magi_kernel.py --backend olmo3_sink_fa3_native
+python tests/manual/olmo3_sink_magi_kernel.py --backend olmo3_sink_fa4
 ```
 
 On Hopper, compare the Magi and native FA3 forward/backward numerics directly:

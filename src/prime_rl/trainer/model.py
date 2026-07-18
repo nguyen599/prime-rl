@@ -541,11 +541,6 @@ def get_model(
             validate_native_fa3_sink_backend()
         else:
             raise ValueError(f"Unknown OLMo3Sink attention backend: {config.attn!r}")
-        if config.attn == "olmo3_sink_fa4" and "sliding_attention" in getattr(model_config, "layer_types", []):
-            raise ValueError(
-                "olmo3_sink_fa4 cannot run OLMo3 sliding-attention layers because Magi's FA4 sink "
-                "interface has no window argument; use olmo3_sink_fa2"
-            )
     model_config.use_cache = False
     is_vlm_arch = is_vlm_architecture(model_config)
 

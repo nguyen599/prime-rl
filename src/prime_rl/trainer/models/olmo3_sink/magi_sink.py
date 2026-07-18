@@ -63,9 +63,10 @@ def validate_magi_sink_backend(attn_impl: str) -> None:
             f"olmo3_sink_fa3 is Hopper-only, but the active device is SM{major}{minor}. "
             "Use olmo3_sink_fa2 or olmo3_sink_fa4 on supported hardware."
         )
-    if attn_impl == "olmo3_sink_fa4" and major < 10:
+    if attn_impl == "olmo3_sink_fa4" and major not in {9, 10, 11, 12}:
         raise RuntimeError(
-            f"olmo3_sink_fa4 requires Blackwell (SM100+), but the active device is SM{major}{minor}"
+            "olmo3_sink_fa4 requires a supported Hopper or Blackwell GPU "
+            f"(SM90/100/110/120), but the active device is SM{major}{minor}"
         )
 
 
@@ -136,11 +137,6 @@ def magi_varlen_attention_with_sink(
             **common_kwargs,
         )
 
-    if window_size != (-1, -1):
-        raise ValueError(
-            "MagiAttention's FA4 sink interface does not support sliding-window attention. "
-            "Use olmo3_sink_fa2 for standard OLMo3 mixed full/sliding layers."
-        )
     return flash_fn(
         q,
         k,
@@ -149,5 +145,6 @@ def magi_varlen_attention_with_sink(
         cu_seqlens_k,
         int(max_seqlen_q),
         int(max_seqlen_k),
+        window_size=window_size,
         **common_kwargs,
     )
